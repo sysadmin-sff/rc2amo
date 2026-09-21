@@ -20,9 +20,9 @@ public class CallLogPollingService : BackgroundService
     // опросах, пока он не выйдет из окна _recentCallWindow. Без этого набора
     // в сделку падает несколько одинаковых заметок про один созвон. Это
     // быстрый pre-check в памяти перед обращением к amoCRM (NoteExistsAsync) —
-    // источник истины при рестарте сервиса именно amoCRM, а не этот HashSet.
-    private readonly HashSet<string> _processedCallIds = new();
-    private DateTime _lastProcessedCleanup = DateTime.UtcNow;
+    // источник истины при рестарте сервиса именно amoCRM, а не этот guard.
+    // Общий с LateAttachService (см. CallProcessingGuard).
+    private readonly CallProcessingGuard _guard;
 
     // Значения RingCentral CallLogRecord.result, означающие, что разговор не
     // состоялся (звонок пропущен/не принят/ушёл на автоответчик и т.п.).
@@ -36,12 +36,14 @@ public class CallLogPollingService : BackgroundService
         ILogger<CallLogPollingService> logger,
         RestClient rc,
         IConfiguration configuration,
-        AmoCrmService amoService)
+        AmoCrmService amoService,
+        CallProcessingGuard guard)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
         _rc = rc;
         _amoService = amoService;
+        _guard = guard;
         _jwt = configuration.GetSection("Credentials")["JWT"];
         
         // Логируем наличие JWT токена (без раскрытия содержимого)
@@ -163,12 +165,7 @@ public class CallLogPollingService : BackgroundService
         {
             // Набор обработанных ID чистим раз в сутки: окно свежести всего 5 минут,
             // так что старые записи держать смысла нет, а память расти не должна.
-            if ((DateTime.UtcNow - _lastProcessedCleanup).TotalHours >= 24)
-            {
-                _logger.LogInformation($"Clearing processed call IDs cache ({_processedCallIds.Count} entries)");
-                _processedCallIds.Clear();
-                _lastProcessedCleanup = DateTime.UtcNow;
-            }
+            _guard.ClearOlderThanIfDue(TimeSpan.FromHours(24));
 
             // Окно выборки: чуть шире окна свежести звонка, с запасом на случай
             // задержек в самом Call Log API.
@@ -213,7 +210,7 @@ public class CallLogPollingService : BackgroundService
                             continue;
                         }
 
-                        if (_processedCallIds.Contains(record.id))
+                        if (_guard.IsProcessed(record.id))
                         {
                             _logger.LogInformation($"Call {record.id} already processed, skipping duplicate");
                             continue;
@@ -226,9 +223,9 @@ public class CallLogPollingService : BackgroundService
                         // (в том числе закономерных "не нашли лид"/"skip"), а не до
                         // вызова — иначе сбой amoCRM внутри ProcessCallRecordAsync
                         // навсегда потеряет звонок в пределах окна свежести: запись
-                        // уйдёт в _processedCallIds ещё ДО того, как заметка реально
+                        // уйдёт в guard ещё ДО того, как заметка реально
                         // создана, и повторный опрос её больше не тронет.
-                        _processedCallIds.Add(record.id);
+                        _guard.MarkProcessed(record.id);
                     }
                     catch (Exception ex)
                     {

@@ -1,4 +1,5 @@
 using RingCentral;
+using RingCentral_amoCRM.Helpers;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -65,6 +66,7 @@ builder.Services.AddHttpClient("AmoCrmClient", client =>
     });
 
 builder.Services.AddSingleton<AmoCrmService>();
+builder.Services.AddSingleton<CallProcessingGuard>();
 builder.Services.AddScoped<SubscriptionService>();
 builder.Services.AddHostedService<SubscriptionHostedService>();
 builder.Services.AddHostedService<CallLogPollingService>();
