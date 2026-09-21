@@ -1,0 +1,155 @@
+using Newtonsoft.Json.Linq;
+using RingCentral;
+using RingCentral_amoCRM.Helpers;
+
+public class SubscriptionService
+{
+    private readonly RestClient _rc;
+    private readonly ILogger<SubscriptionService> _logger;
+    private readonly string _jwt;
+    private readonly string WebHookUrl;
+    private DateTime _expiresAt;
+
+    public SubscriptionService(RestClient rc, ILogger<SubscriptionService> logger, IConfiguration configuration)
+    {
+        _rc = rc;
+        _logger = logger;
+        _jwt = configuration.GetSection("Credentials")["JWT"];
+        
+        // Логируем наличие JWT токена
+        if (string.IsNullOrWhiteSpace(_jwt))
+        {
+            _logger.LogError("⚠️ JWT token is EMPTY or NULL in configuration!");
+        }
+        else
+        {
+            _logger.LogInformation("✅ JWT token loaded successfully (length: {Length} chars)", _jwt.Length);
+        }
+        
+        var expiresAtStr = configuration.GetSection("Credentials")["ExpiresAt"];
+        _expiresAt = string.IsNullOrEmpty(expiresAtStr) ? DateTime.UtcNow : DateTime.Parse(expiresAtStr);
+        WebHookUrl = configuration.GetSection("Credentials")["RedirectUri"] + "/api/RingCentralWebHook/webhook";
+    }
+    
+    private async Task EnsureAuthorized()
+    {
+        _logger.LogInformation($"Ensuring RingCentral client is authorized... token exp.{_expiresAt} date now {DateTime.UtcNow}");
+        
+        // Проверяем наличие JWT токена
+        if (string.IsNullOrWhiteSpace(_jwt))
+        {
+            _logger.LogError("❌ JWT token is empty! Cannot authorize RingCentral.");
+            throw new InvalidOperationException("JWT token is not configured.");
+        }
+        
+        // Проверяем токен RingCentral с буфером в 5 минут перед истечением
+        if (_rc.token == null || _expiresAt.AddMinutes(-5) <= DateTime.UtcNow)
+        {
+            _logger.LogInformation("RingCentral token is null or expiring soon, authorizing with JWT (length: {Length})...", _jwt.Length);
+            
+            try
+            {
+                var token = await _rc.Authorize(_jwt);
+                
+                // Обновляем только время истечения, НЕ ПЕРЕЗАПИСЫВАЕМ JWT!
+                _expiresAt = DateTime.UtcNow.AddSeconds(token.expires_in ?? 3600);
+                UpdateApp.UpdateAppSetting("Credentials:ExpiresAt", _expiresAt.ToString("o"));
+                
+                _logger.LogInformation("✅ RingCentral authorized successfully. Token expires at {ExpiresAt}", _expiresAt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to authorize RingCentral with JWT");
+                throw;
+            }
+        }
+        else
+        {
+            _logger.LogInformation("RingCentral token is still valid until {ExpiresAt}", _expiresAt);
+        }
+    }
+
+    public async Task<string> CreateSmsSubscriptionAsync()
+    {
+        await EnsureAuthorized();
+        var subscriptions = await _rc.Restapi().Subscription().List();
+        var users = await _rc.Restapi().Account().Extension().List();
+        
+        IEnumerable<long?> usersIds = users.records.Select(ext => ext.id).ToList();
+        
+        _logger.LogInformation("Attempting to create RingCentral WebHook subscription...");
+        
+        // 1. Настройка фильтров событий
+        var subscriptionInfo = new CreateSubscriptionRequest
+        {
+            // Подписываемся на события в хранилище сообщений для SMS
+            eventFilters = usersIds.Select(c => $"/restapi/v1.0/account/~/extension/{c}/message-store/instant?type=SMS").ToArray(),
+            
+            // 2. Настройка способа доставки (WebHook)
+            deliveryMode = new NotificationDeliveryModeRequest()
+            {
+                transportType = "WebHook",
+                address = WebHookUrl // Ваш публичный адрес!
+            },
+            
+            // 3. Срок действия (Максимум 7 дней, устанавливаем 6 дней в секундах)
+            expiresIn = 3600 * 24 * 6 
+        };
+
+        try
+        {
+            if (subscriptions.records.Any())
+            {
+                foreach (var subscription in subscriptions.records)
+                {
+                    await _rc.Restapi().Subscription(subscription.id).Delete();
+                }
+            }
+            // 4. Выполнение API-вызова для создания подписки
+            var response = await _rc.Restapi().Subscription().Post(subscriptionInfo);
+            
+            _logger.LogInformation($"✅ Подписка успешно создана для аккаунтов {string.Join(",", usersIds)}!");
+            _logger.LogInformation($"ID: {response.id}, Истекает: {response.expirationTime}");
+            
+            // Сохраните ID подписки для последующего продления!
+            return response.id;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Ошибка при создании подписки RingCentral. Убедитесь, что WebHook URL доступен.");
+            return null;
+        }
+    }
+
+    // Новая периодическая выборка call log
+    public async Task PollCallLogsAsync()
+    {
+        await EnsureAuthorized();
+
+        try
+        {
+            var callLogs = await _rc.Restapi().Account().CallLog().List();
+            // Логируем количество записей (если API возвращает массив 'records')
+            if (callLogs != null)
+            {
+                try
+                {
+                    var count = callLogs.records?.Length ?? 0;
+                    _logger.LogInformation("Fetched call logs: {Count} records", count);
+                }
+                catch
+                {
+                    _logger.LogInformation("Fetched call logs (unknown count).");
+                }
+            }
+            else
+            {
+                _logger.LogInformation("Call log response was null.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while polling call logs from RingCentral API.");
+        }
+    }
+}
