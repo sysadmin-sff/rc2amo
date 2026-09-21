@@ -1439,7 +1439,13 @@ private async Task RunStartupCatchUpAsync()
                     continue;
                 }
 
-                await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP");
+                DateTime? callStartUtc = string.IsNullOrEmpty(record.startTime)
+                    ? null
+                    : DateTime.Parse(record.startTime, null,
+                        System.Globalization.DateTimeStyles.AdjustToUniversal |
+                        System.Globalization.DateTimeStyles.AssumeUniversal);
+
+                await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc);
             }
             catch (Exception ex)
             {
