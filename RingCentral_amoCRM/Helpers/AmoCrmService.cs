@@ -993,6 +993,15 @@ public class AmoCrmService
             ["params"] = paramsObject
         };
 
+        // ВНИМАНИЕ: created_at как принимаемое поле при создании заметки НЕ
+        // подтверждён официальной документацией amoCRM v4 (документированный
+        // список полей для POST .../notes — entity_id/note_type/params/
+        // created_by/responsible_user_id/request_id/is_need_to_trigger_digital_pipeline,
+        // created_at в ответах описан как read-only). Отправляем его как
+        // попытку — по опыту многие клиенты amoCRM его всё же принимают, а
+        // human-readable время в source (выше) служит страховкой на случай,
+        // если поле проигнорируется. Требует эмпирической проверки на
+        // реальном аккаунте.
         if (callStartUtc.HasValue)
         {
             noteObject["created_at"] = ((DateTimeOffset)DateTime.SpecifyKind(callStartUtc.Value, DateTimeKind.Utc)).ToUnixTimeSeconds();
@@ -1020,11 +1029,19 @@ public class AmoCrmService
     // (record только что увиден, свежий), и поздней привязкой (record может
     // быть до LateAttach:LookbackDays суток "старым"). logPrefix уходит в
     // каждую лог-строку, чтобы различать источник в общем логе.
+    //
+    // failClosed передаётся в NoteExistsAsync как есть: основной поллинг
+    // (свежий звонок, узкое окно, следующего шанса нет) — fail-open по
+    // умолчанию; поздняя привязка и догон при старте вызывают с true — у
+    // них есть следующий цикл опроса, так что при невозможности достоверно
+    // проверить наличие заметки безопаснее вернуть Error и не помечать
+    // звонок обработанным, чем рискнуть создать дубль.
     public async Task<CallProcessingResult> ProcessSingleCallAsync(
         RingCentral.CallLogRecord record,
         CallProcessingGuard guard,
         string logPrefix,
-        DateTime? callStartUtc = null)
+        DateTime? callStartUtc = null,
+        bool failClosed = false)
     {
         if (record.from == null || record.to == null)
         {
@@ -1066,7 +1083,21 @@ public class AmoCrmService
 
             var noteType = record.direction == "Inbound" ? "call_in" : "call_out";
 
-            if (await NoteExistsAsync(targetLeadId.Value, noteType, record.id))
+            bool noteExists;
+            try
+            {
+                noteExists = await NoteExistsAsync(targetLeadId.Value, noteType, record.id, failClosed, callStartUtc);
+            }
+            catch (NoteExistenceUnknownException ex)
+            {
+                // Не помечаем guard.MarkProcessed — звонок остаётся доступным
+                // для повторной попытки на следующем цикле/проходе.
+                _logger.LogWarning(ex, "{Prefix} id={Id} number={Number} lead={LeadId} action=error reason=note_check_failed",
+                    logPrefix, record.id, searchNumber, targetLeadId);
+                return CallProcessingResult.Error;
+            }
+
+            if (noteExists)
             {
                 guard.MarkProcessed(record.id);
                 _logger.LogInformation("{Prefix} id={Id} number={Number} lead={LeadId} action=dup", logPrefix, record.id, searchNumber, targetLeadId);
