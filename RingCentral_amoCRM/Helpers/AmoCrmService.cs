@@ -778,7 +778,10 @@ public class AmoCrmService
     // it, so uniqId is NOT sent to amoCRM. It is only used for the log line
     // below (to cross-reference against RingCentral's message id) and by the
     // caller for the in-memory _processedSmsIds dedup check.
-    public async Task CreateNoteAsync(long leadId, string noteText, string phone, string noteType, string uniqId)
+    // Возвращает true только при 2xx-ответе amoCRM. Вызывающий код обязан
+    // проверить результат перед тем, как помечать SMS обработанным — иначе
+    // не-2xx (например 400 из-за некорректного payload) молча теряет SMS.
+    public async Task<bool> CreateNoteAsync(long leadId, string noteText, string phone, string noteType, string uniqId)
     {
         const string entityType = "leads";
 
@@ -805,12 +808,12 @@ public class AmoCrmService
         if (resp.IsSuccessStatusCode)
         {
             _logger.LogInformation("Note added to amoCRM (Lead ID: {LeadId}) successfully. RingCentral message id: {MessageId}", leadId, uniqId);
+            return true;
         }
-        else
-        {
-            var err = await resp.Content.ReadAsStringAsync();
-            _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}. RingCentral message id: {MessageId}", resp.StatusCode, err, uniqId);
-        }
+
+        var err = await resp.Content.ReadAsStringAsync();
+        _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}. RingCentral message id: {MessageId}", resp.StatusCode, err, uniqId);
+        return false;
     }
 
     public async Task<string> UploadCallRecordingAsync(string recordingId, string callId)

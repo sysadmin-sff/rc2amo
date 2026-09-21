@@ -156,7 +156,15 @@ public class RingCentralWebHookController : ControllerBase
                         $"Сообщение: {smsText}";
 
                     // 5. Добавляем примечание в карточку сделки
-                    await _amoService.CreateNoteAsync(targetLeadId.Value, noteContent, searchNumber, noteType, notification.Body.Id);
+                    bool smsNoteCreated = await _amoService.CreateNoteAsync(targetLeadId.Value, noteContent, searchNumber, noteType, notification.Body.Id);
+                    if (!smsNoteCreated)
+                    {
+                        // Не помечаем обработанным — заметка не создана, следующий
+                        // вебхук/ретрай от RC (если будет) сможет попробовать снова.
+                        _logger.LogWarning("SMS {Id} note creation failed, not marking as processed", notification.Body.Id);
+                        return Ok();
+                    }
+
                     _amoService.MarkSmsProcessed(notification.Body.Id);
                     return Created();
                 }
