@@ -264,8 +264,15 @@ public class AmoCrmService
         var contact = JsonSerializer.Deserialize<AmoCrmContactsResponse>(
             json,
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+        if (contact?.Embedded?.Contacts == null)
+        {
+            _logger.LogWarning("No lead found for number {Number}.", phoneNumber);
+            return null;
+        }
+
         IEnumerable<long> leadsids;
-        if (contact.Embedded.Contacts.Any(c => c.Embedded.Leads.Any()))
+        if (contact.Embedded.Contacts.Any(c => c.Embedded.Leads != null && c.Embedded.Leads.Any()))
         {
             leadsids = contact.Embedded.Contacts
                         .Where(c => c.Embedded.Leads != null)
