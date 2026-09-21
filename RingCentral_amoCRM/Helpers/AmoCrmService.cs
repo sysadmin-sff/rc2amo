@@ -394,22 +394,26 @@ public class AmoCrmService
         return false;
     }
 
-    // Create a note attached to an entity (lead/contact). element_type: 1 = contact, 2 = lead
-    public async Task CreateNoteAsync(long leadId, string noteText, string phone)
+    // Create an SMS note attached to a lead. noteType: "sms_in" or "sms_out".
+    // uniqId carries RingCentral's message id so NoteExistsAsync can dedupe.
+    public async Task CreateNoteAsync(long leadId, string noteText, string phone, string noteType, string uniqId)
     {
-        const string entityType = "leads"; 
-    
+        const string entityType = "leads";
+
         const long responsibleUserId = 8644141;
+
+        var textPrefix = noteType == "sms_out" ? "Исходящее SMS к" : "Входящее SMS от";
 
         var rootJsonArray = new JsonArray
         {
             new JsonObject
             {
-                ["note_type"] = "sms_in", 
-                ["params"] = new JsonObject 
-                { 
-                    ["text"] = $"Входящее SMS от {phone}: {noteText}",
-                    ["phone"] = $"{phone}"
+                ["note_type"] = noteType,
+                ["params"] = new JsonObject
+                {
+                    ["text"] = $"{textPrefix} {phone}: {noteText}",
+                    ["phone"] = $"{phone}",
+                    ["uniq"] = uniqId
                 }
             }
         };

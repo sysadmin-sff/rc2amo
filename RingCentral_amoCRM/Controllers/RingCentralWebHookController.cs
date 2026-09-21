@@ -116,7 +116,7 @@ public class RingCentralWebHookController : ControllerBase
                             $"от: {(string.IsNullOrEmpty(notification.Body.From.Name) ? "Неизвестен" : notification.Body.From.Name)} ({notification.Body.From.PhoneNumber})\n" +
                             $"Сообщение: {smsText}";
                         // 3. Добавляем примечание в карточку сделки
-                            await _amoService.CreateNoteAsync(leadsId, noteContent, senderNumber);
+                            await _amoService.CreateNoteAsync(leadsId, noteContent, senderNumber, "sms_in", notification.Body.Id);
                             return Created();
                     }
                 }
@@ -151,7 +151,7 @@ public class RingCentralWebHookController : ControllerBase
                     $"Вложение: <img scr=\"{notification.Body.Attachments[1].Uri}\" alt=\"attachment\">";
 
                 // 3. Добавляем примечание в карточку сделки
-                await _amoService.CreateNoteAsync(leadId, noteContent, notification.Body.From.PhoneNumber);
+                await _amoService.CreateNoteAsync(leadId, noteContent, notification.Body.From.PhoneNumber, "sms_in", notification.Body.Id);
             }
         }
         else
