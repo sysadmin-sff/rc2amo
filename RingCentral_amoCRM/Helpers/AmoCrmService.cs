@@ -285,6 +285,52 @@ public class AmoCrmService
         return null;
     }
 
+    private const long ClosedWonStatusId = 142;
+    private const long ClosedLostStatusId = 143;
+
+    // Picks a single target lead out of a pool of candidates: prefers the most
+    // recently updated OPEN lead (status not closed-won/closed-lost); if none
+    // are open, falls back to the most recently updated lead overall.
+    public async Task<long?> ResolveTargetLeadAsync(IEnumerable<long> candidateLeadIds)
+    {
+        var ids = candidateLeadIds?.Distinct().ToList();
+        if (ids == null || ids.Count == 0)
+        {
+            return null;
+        }
+
+        if (ids.Count == 1)
+        {
+            return ids[0];
+        }
+
+        var query = string.Join("&", ids.Select(id => $"filter[id][]={id}"));
+        var response = await _httpClient.GetAsync($"/api/v4/leads?{query}");
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogError("Lead resolution request failed: {StatusCode}", response.StatusCode);
+            return null;
+        }
+
+        var json = await response.Content.ReadAsStringAsync();
+        var leadsResponse = JsonSerializer.Deserialize<AmoCrmLeadsListResponse>(
+            json,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+        var leads = leadsResponse?.Embedded?.Leads;
+        if (leads == null || leads.Count == 0)
+        {
+            _logger.LogWarning("Lead resolution: none of the candidate leads {Ids} were returned by amoCRM", string.Join(",", ids));
+            return null;
+        }
+
+        var openLeads = leads.Where(l => l.StatusId != ClosedWonStatusId && l.StatusId != ClosedLostStatusId).ToList();
+        var pool = openLeads.Count > 0 ? openLeads : leads;
+
+        return pool.OrderByDescending(l => l.UpdatedAt).First().Id;
+    }
+
     // Create a note attached to an entity (lead/contact). element_type: 1 = contact, 2 = lead
     public async Task CreateNoteAsync(long leadId, string noteText, string phone)
     {
