@@ -70,6 +70,7 @@ builder.Services.AddSingleton<CallProcessingGuard>();
 builder.Services.AddScoped<SubscriptionService>();
 builder.Services.AddHostedService<SubscriptionHostedService>();
 builder.Services.AddHostedService<CallLogPollingService>();
+builder.Services.AddHostedService<LateAttachService>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 

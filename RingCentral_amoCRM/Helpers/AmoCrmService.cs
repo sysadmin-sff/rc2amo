@@ -496,6 +496,55 @@ public class AmoCrmService
         return result;
     }
 
+    // Дотягивает custom_fields_values (включая PHONE) для контактов,
+    // известных только по id — например, тех, что пришли через
+    // GetUpdatedLeadsWithContactsAsync, где /leads?with=contacts не отдаёт
+    // custom-поля контакта, только id/name.
+    public async Task<List<AmoCrmContact>> GetContactsByIdsAsync(IReadOnlyCollection<long> ids)
+    {
+        var result = new List<AmoCrmContact>();
+        if (ids == null || ids.Count == 0)
+        {
+            return result;
+        }
+
+        // amoCRM ограничивает длину query string; для планового объёма (сотни
+        // изменённых сделок за цикл при импорте) режем на батчи по 100 id.
+        const int batchSize = 100;
+        var idsList = ids.Distinct().ToList();
+
+        for (int offset = 0; offset < idsList.Count; offset += batchSize)
+        {
+            var batch = idsList.Skip(offset).Take(batchSize);
+            var query = string.Join("&", batch.Select(id => $"filter[id][]={id}"));
+
+            var response = await _httpClient.GetAsync($"/api/v4/contacts?{query}&limit={batchSize}");
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
+            {
+                continue;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var err = await response.Content.ReadAsStringAsync();
+                _logger.LogError("GetContactsByIdsAsync: amoCRM returned {StatusCode} {Error}", response.StatusCode, err);
+                throw new Exception($"GetContactsByIdsAsync failed: {response.StatusCode}");
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var parsed = JsonSerializer.Deserialize<AmoCrmContactsResponse>(
+                json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            if (parsed?.Embedded?.Contacts != null)
+            {
+                result.AddRange(parsed.Embedded.Contacts);
+            }
+        }
+
+        return result;
+    }
+
     // Сделки, изменённые с sinceUtc, вместе с привязанными контактами.
     // Нужны отдельно от GetUpdatedContactsAsync: если к существующему
     // (не изменившемуся) контакту добавили сделку, сам контакт может не
