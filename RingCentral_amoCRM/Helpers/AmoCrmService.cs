@@ -280,7 +280,10 @@ public class AmoCrmService
 
         if(response.StatusCode == System.Net.HttpStatusCode.NoContent)
         {
-            _logger.LogError($"No leads found by number {phoneNumber}");
+            // Штатный исход: контакта с таким номером в amoCRM ещё нет —
+            // не ошибка сервиса, а ожидаемое "нет лида пока", особенно
+            // часто для поздней привязки/начального прохода.
+            _logger.LogInformation($"No leads found by number {phoneNumber}");
             return null;
         }
 
