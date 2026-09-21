@@ -364,6 +364,8 @@ public class AmoCrmService
     }
 
     private const int NoteExistsMaxPages = 5;
+    private const int UpdatedEntitiesPageSize = 250;
+    private const int UpdatedEntitiesMaxPages = 50;
 
     // Checks whether a lead already has a note of the given type carrying
     // params.uniq == uniqValue. amoCRM's notes endpoint has no server-side
@@ -438,6 +440,170 @@ public class AmoCrmService
         }
 
         return false;
+    }
+
+    // Контакты, изменённые с sinceUtc (включительно). with=leads — чтобы
+    // не делать отдельный запрос за связанными сделками для каждого контакта.
+    public async Task<List<AmoCrmContact>> GetUpdatedContactsAsync(DateTime sinceUtc)
+    {
+        var result = new List<AmoCrmContact>();
+        var sinceUnix = ((DateTimeOffset)DateTime.SpecifyKind(sinceUtc, DateTimeKind.Utc)).ToUnixTimeSeconds();
+
+        for (int page = 1; page <= UpdatedEntitiesMaxPages; page++)
+        {
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.GetAsync(
+                    $"/api/v4/contacts?filter[updated_at][from]={sinceUnix}&with=leads&limit={UpdatedEntitiesPageSize}&page={page}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "GetUpdatedContactsAsync: request failed on page {Page}", page);
+                throw;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
+            {
+                break;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var err = await response.Content.ReadAsStringAsync();
+                _logger.LogError("GetUpdatedContactsAsync: amoCRM returned {StatusCode} {Error}", response.StatusCode, err);
+                throw new Exception($"GetUpdatedContactsAsync failed: {response.StatusCode}");
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var parsed = JsonSerializer.Deserialize<AmoCrmContactsResponse>(
+                json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            var contacts = parsed?.Embedded?.Contacts;
+            if (contacts == null || contacts.Count == 0)
+            {
+                break;
+            }
+
+            result.AddRange(contacts);
+
+            if (contacts.Count < UpdatedEntitiesPageSize)
+            {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    // Сделки, изменённые с sinceUtc, вместе с привязанными контактами.
+    // Нужны отдельно от GetUpdatedContactsAsync: если к существующему
+    // (не изменившемуся) контакту добавили сделку, сам контакт может не
+    // попасть в выборку по updated_at, а вот сделка — попадёт всегда,
+    // т.к. она только что создана/обновлена.
+    public async Task<List<AmoCrmLeadDetail>> GetUpdatedLeadsWithContactsAsync(DateTime sinceUtc)
+    {
+        var result = new List<AmoCrmLeadDetail>();
+        var sinceUnix = ((DateTimeOffset)DateTime.SpecifyKind(sinceUtc, DateTimeKind.Utc)).ToUnixTimeSeconds();
+
+        for (int page = 1; page <= UpdatedEntitiesMaxPages; page++)
+        {
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.GetAsync(
+                    $"/api/v4/leads?filter[updated_at][from]={sinceUnix}&with=contacts&limit={UpdatedEntitiesPageSize}&page={page}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "GetUpdatedLeadsWithContactsAsync: request failed on page {Page}", page);
+                throw;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
+            {
+                break;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var err = await response.Content.ReadAsStringAsync();
+                _logger.LogError("GetUpdatedLeadsWithContactsAsync: amoCRM returned {StatusCode} {Error}", response.StatusCode, err);
+                throw new Exception($"GetUpdatedLeadsWithContactsAsync failed: {response.StatusCode}");
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var parsed = JsonSerializer.Deserialize<AmoCrmLeadsListResponse>(
+                json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            var leads = parsed?.Embedded?.Leads;
+            if (leads == null || leads.Count == 0)
+            {
+                break;
+            }
+
+            result.AddRange(leads);
+
+            if (leads.Count < UpdatedEntitiesPageSize)
+            {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    // Последние 10 цифр — минимальный общий знаменатель между форматами
+    // amoCRM (+1XXXXXXXXXX/XXXXXXXXXX) и RingCentral (phoneNumber в call log).
+    private static string NormalizePhone(string phone)
+    {
+        if (string.IsNullOrWhiteSpace(phone))
+        {
+            return null;
+        }
+
+        var digits = new string(phone.Where(char.IsDigit).ToArray());
+        return digits.Length >= 10 ? digits[^10..] : null;
+    }
+
+    // Собирает нормализованные телефоны контактов из значений custom-поля
+    // PHONE (field_code == "PHONE"). Multitext-поле — берём ВСЕ значения,
+    // не только первое: у контакта может быть несколько номеров, и звонок
+    // мог прийти с любого из них.
+    public static HashSet<string> ExtractNormalizedPhones(IEnumerable<AmoCrmContact> contacts)
+    {
+        var phones = new HashSet<string>();
+        if (contacts == null)
+        {
+            return phones;
+        }
+
+        foreach (var contact in contacts)
+        {
+            if (contact.CustomFieldsValues == null)
+            {
+                continue;
+            }
+
+            foreach (var field in contact.CustomFieldsValues)
+            {
+                if (field.FieldCode != "PHONE" || field.Values == null)
+                {
+                    continue;
+                }
+
+                foreach (var value in field.Values)
+                {
+                    var normalized = NormalizePhone(value.Value);
+                    if (normalized != null)
+                    {
+                        phones.Add(normalized);
+                    }
+                }
+            }
+        }
+
+        return phones;
     }
 
     // Create an SMS note attached to a lead. noteType: "sms_in" or "sms_out".
