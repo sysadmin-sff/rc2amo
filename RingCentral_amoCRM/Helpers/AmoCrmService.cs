@@ -366,11 +366,94 @@ public class AmoCrmService
     private const int NoteExistsMaxPages = 5;
     private const int UpdatedEntitiesPageSize = 250;
     private const int UpdatedEntitiesMaxPages = 50;
+    private const int NoteExistsRetryMaxAttempts = 3;
+    private static readonly TimeSpan[] NoteExistsRetryDelays =
+    {
+        TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)
+    };
+
+    // Брошено NoteExistsAsync(failClosed: true), когда мы не смогли достоверно
+    // проверить, есть ли уже заметка (сбой запроса, не-успешный статус после
+    // повторов, или исчерпан лимит страниц). Вызывающий код должен трактовать
+    // это как ошибку обработки звонка, а не как "заметки нет".
+    public class NoteExistenceUnknownException : Exception
+    {
+        public NoteExistenceUnknownException(string message, Exception inner = null)
+            : base(message, inner) { }
+    }
+
+    // Повторяет запрос до NoteExistsRetryMaxAttempts раз на HTTP 429, выдерживая
+    // паузу по Retry-After (секунды или HTTP-date), а если заголовка нет —
+    // 1-2-4 секунды. Возвращает последний ответ как есть (включая 429/5xx) —
+    // вызывающий код сам решает, что делать с неуспехом (fail-open/fail-closed).
+    private async Task<HttpResponseMessage> SendWithRetryAsync(Func<Task<HttpResponseMessage>> sendRequest)
+    {
+        HttpResponseMessage response = null;
+
+        for (int attempt = 1; attempt <= NoteExistsRetryMaxAttempts; attempt++)
+        {
+            response = await sendRequest();
+
+            if (response.StatusCode != System.Net.HttpStatusCode.TooManyRequests || attempt == NoteExistsRetryMaxAttempts)
+            {
+                return response;
+            }
+
+            var delay = NoteExistsRetryDelays[attempt - 1];
+            if (response.Headers.RetryAfter != null)
+            {
+                if (response.Headers.RetryAfter.Delta.HasValue)
+                {
+                    delay = response.Headers.RetryAfter.Delta.Value;
+                }
+                else if (response.Headers.RetryAfter.Date.HasValue)
+                {
+                    var untilDate = response.Headers.RetryAfter.Date.Value - DateTimeOffset.UtcNow;
+                    if (untilDate > TimeSpan.Zero)
+                    {
+                        delay = untilDate;
+                    }
+                }
+            }
+
+            _logger.LogWarning("amoCRM returned 429, retrying in {Delay}s (attempt {Attempt}/{Max})",
+                delay.TotalSeconds, attempt, NoteExistsRetryMaxAttempts);
+            await Task.Delay(delay);
+        }
+
+        return response;
+    }
 
     // Checks whether a lead already has a note of the given type carrying
     // params.uniq == uniqValue. amoCRM's notes endpoint has no server-side
     // filter on custom params fields, so this scans notes filtered by type.
-    public async Task<bool> NoteExistsAsync(long leadId, string noteType, string uniqValue)
+    //
+    // failClosed управляет поведением при невозможности достоверно проверить:
+    // - false (основной поллинг, звонок только что случился): fail-open,
+    //   возвращает false ("заметки нет") — редкий дубль при сбое API лучше,
+    //   чем потерянный звонок в узком 5-минутном окне без повторных попыток.
+    // - true (поздняя привязка, догон при старте): fail-closed, бросает
+    //   NoteExistenceUnknownException — у этих путей есть следующий цикл
+    //   опроса, так что безопаснее не создавать заметку "вслепую", когда
+    //   мы не смогли проверить, а вместо этого попробовать снова позже.
+    //
+    // notEarlierThanUtc — необязательная оптимизация: если передано, в запрос
+    // добавляется filter[updated_at][from] (минус час запаса), чтобы отсечь
+    // заметки, обновлённые раньше звонка, и снизить число просматриваемых
+    // страниц. ВНИМАНИЕ: предположение "у заметки с явно заданным created_at
+    // updated_at не может быть раньше времени звонка" НЕ подтверждено
+    // документацией amoCRM v4 — created_at как принимаемое поле при создании
+    // заметки вообще не задокументирован официально (см. комментарий в
+    // CreateCallNoteAsync). Это чисто серверная оптимизация поверх основного
+    // скана по note_type, а не замена ему: если фильтр не даст ожидаемого
+    // эффекta, логика останется корректной, просто медленнее. Требует
+    // эмпирической проверки на реальном amoCRM-аккаунте.
+    public async Task<bool> NoteExistsAsync(
+        long leadId,
+        string noteType,
+        string uniqValue,
+        bool failClosed = false,
+        DateTime? notEarlierThanUtc = null)
     {
         // sms_in/sms_out notes never carry params.uniq (amoCRM rejects it with
         // 400 FieldNotExpected on creation — see CreateNoteAsync), so scanning
@@ -381,16 +464,31 @@ public class AmoCrmService
             return false;
         }
 
+        string updatedAtFilter = "";
+        if (notEarlierThanUtc.HasValue)
+        {
+            var sinceUnix = ((DateTimeOffset)DateTime.SpecifyKind(notEarlierThanUtc.Value, DateTimeKind.Utc))
+                .AddHours(-1)
+                .ToUnixTimeSeconds();
+            updatedAtFilter = $"&filter[updated_at][from]={sinceUnix}";
+        }
+
         for (int page = 1; page <= NoteExistsMaxPages; page++)
         {
             HttpResponseMessage response;
             try
             {
-                response = await _httpClient.GetAsync(
-                    $"/api/v4/leads/{leadId}/notes?filter[note_type]={Uri.EscapeDataString(noteType)}&limit=250&page={page}&order[updated_at]=desc");
+                response = await SendWithRetryAsync(() => _httpClient.GetAsync(
+                    $"/api/v4/leads/{leadId}/notes?filter[note_type]={Uri.EscapeDataString(noteType)}{updatedAtFilter}&limit=250&page={page}&order[updated_at]=desc"));
             }
             catch (Exception ex)
             {
+                if (failClosed)
+                {
+                    throw new NoteExistenceUnknownException(
+                        $"NoteExistsAsync: request to amoCRM failed for lead {leadId} (fail-closed)", ex);
+                }
+
                 // Fail-open: сбой запроса к amoCRM не должен блокировать создание заметки.
                 // Редкий дубль при сбое API — меньшее зло, чем потерянный звонок/SMS,
                 // особенно с учётом узкого окна свежести и отсутствия повторных попыток.
@@ -405,6 +503,12 @@ public class AmoCrmService
 
             if (!response.IsSuccessStatusCode)
             {
+                if (failClosed)
+                {
+                    throw new NoteExistenceUnknownException(
+                        $"NoteExistsAsync: amoCRM returned {response.StatusCode} for lead {leadId} (fail-closed)");
+                }
+
                 // Fail-open здесь же: 429/5xx/прочие ошибки amoCRM трактуются как
                 // "заметки не нашли", а не как "заметка точно есть".
                 _logger.LogWarning("NoteExistsAsync: amoCRM returned {StatusCode} for lead {LeadId}, assuming note does not exist (fail-open)", response.StatusCode, leadId);
@@ -437,6 +541,12 @@ public class AmoCrmService
             {
                 return false;
             }
+        }
+
+        if (failClosed)
+        {
+            throw new NoteExistenceUnknownException(
+                $"NoteExistsAsync: exhausted {NoteExistsMaxPages} pages for lead {leadId} without a definitive answer (fail-closed)");
         }
 
         return false;
