@@ -22,6 +22,22 @@ public class AmoCrmService
     private readonly IConfiguration _configuration;
     private readonly RestClient _rc;
 
+    // Быстрый pre-check в памяти для SMS (аналог _processedCallIds у звонков).
+    // Живёт здесь, а не в контроллере, т.к. AmoCrmService — singleton, а
+    // контроллер создаётся per-request. Источник истины при рестарте —
+    // NoteExistsAsync через amoCRM, а не этот набор.
+    private readonly HashSet<string> _processedSmsIds = new();
+
+    public bool IsSmsProcessed(string smsId) => !string.IsNullOrEmpty(smsId) && _processedSmsIds.Contains(smsId);
+
+    public void MarkSmsProcessed(string smsId)
+    {
+        if (!string.IsNullOrEmpty(smsId))
+        {
+            _processedSmsIds.Add(smsId);
+        }
+    }
+
     public AmoCrmService(IHttpClientFactory httpClientFactory, IConfiguration configuration, ILogger<AmoCrmService> logger, RestClient rc)
     {
         _configuration = configuration;

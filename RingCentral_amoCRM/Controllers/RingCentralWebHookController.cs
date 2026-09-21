@@ -95,30 +95,70 @@ public class RingCentralWebHookController : ControllerBase
                     notification.Body.Type == "SMS")
                 {
                     string smsText = notification.Body.Subject;
-                    string senderNumber = notification.Body.From.PhoneNumber;
                     string senderName = notification.Body.From.Name;
-                    _logger.LogInformation("Received SMS from {SenderNumber} ({senderName}). Text: {SmsText}",
-                        senderNumber, senderName, smsText);
+                    bool isOutbound = notification.Body.Direction == "Outbound";
+
+                    // Для исходящего SMS клиент — это получатель (To), а не From (это наш номер).
+                    string searchNumber = isOutbound
+                        ? notification.Body.To?.FirstOrDefault()?.PhoneNumber
+                        : notification.Body.From?.PhoneNumber;
+
+                    _logger.LogInformation("Received {Direction} SMS, searching by {SearchNumber} ({SenderName}). Text: {SmsText}",
+                        notification.Body.Direction, searchNumber, senderName, smsText);
+
+                    if (string.IsNullOrWhiteSpace(searchNumber))
+                    {
+                        _logger.LogWarning("SMS {Id}: no usable phone number to search, skipping", notification.Body.Id);
+                        return Ok();
+                    }
+
+                    if (_amoService.IsSmsProcessed(notification.Body.Id))
+                    {
+                        _logger.LogInformation("SMS {Id} already processed, skipping duplicate", notification.Body.Id);
+                        return Ok();
+                    }
 
                     if (_amoService.IsExpired())
                     {
                         await _amoService.InitializeAsync();
                     }
 
-                    // 1. Ищем ID сделки по номеру телефона
-                    IEnumerable<long> leadsIds = await _amoService.FindLeadByPhoneNumberAsync(senderNumber);
-
-                    foreach (long leadsId in leadsIds)
+                    // 1. Ищем ID сделок по номеру телефона
+                    IEnumerable<long> candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
+                    if (candidateLeads == null)
                     {
-                        // 2. Формируем текст примечания
-                        string noteContent =
-                            $"\nКому: {(string.IsNullOrEmpty(notification.Body.To.First().Name) ? "Неизвестен" : notification.Body.To.First().Name)} ({notification.Body.To.First().PhoneNumber})\n" +
-                            $"от: {(string.IsNullOrEmpty(notification.Body.From.Name) ? "Неизвестен" : notification.Body.From.Name)} ({notification.Body.From.PhoneNumber})\n" +
-                            $"Сообщение: {smsText}";
-                        // 3. Добавляем примечание в карточку сделки
-                            await _amoService.CreateNoteAsync(leadsId, noteContent, senderNumber, "sms_in", notification.Body.Id);
-                            return Created();
+                        _logger.LogInformation("No leads found for SMS number {Number}", searchNumber);
+                        return Ok();
                     }
+
+                    // 2. Выбираем одну сделку: открытую (самую свежую), иначе самую свежую из всех
+                    var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
+                    if (targetLeadId == null)
+                    {
+                        _logger.LogWarning("Could not resolve a target lead for SMS {Id}", notification.Body.Id);
+                        return Ok();
+                    }
+
+                    var noteType = isOutbound ? "sms_out" : "sms_in";
+
+                    // 3. Идемпотентность: не создаём заметку повторно, если она уже есть в amoCRM
+                    if (await _amoService.NoteExistsAsync(targetLeadId.Value, noteType, notification.Body.Id))
+                    {
+                        _logger.LogInformation("SMS {Id} already has a note on lead {LeadId}, skipping", notification.Body.Id, targetLeadId);
+                        _amoService.MarkSmsProcessed(notification.Body.Id);
+                        return Ok();
+                    }
+
+                    // 4. Формируем текст примечания
+                    string noteContent =
+                        $"\nКому: {(string.IsNullOrEmpty(notification.Body.To.First().Name) ? "Неизвестен" : notification.Body.To.First().Name)} ({notification.Body.To.First().PhoneNumber})\n" +
+                        $"от: {(string.IsNullOrEmpty(notification.Body.From.Name) ? "Неизвестен" : notification.Body.From.Name)} ({notification.Body.From.PhoneNumber})\n" +
+                        $"Сообщение: {smsText}";
+
+                    // 5. Добавляем примечание в карточку сделки
+                    await _amoService.CreateNoteAsync(targetLeadId.Value, noteContent, searchNumber, noteType, notification.Body.Id);
+                    _amoService.MarkSmsProcessed(notification.Body.Id);
+                    return Created();
                 }
             }
         }
