@@ -218,14 +218,21 @@ public class CallLogPollingService : BackgroundService
                             _logger.LogInformation($"Call {record.id} already processed, skipping duplicate");
                             continue;
                         }
-                        _processedCallIds.Add(record.id);
 
                         _logger.LogInformation($"Start processing call {record.id} call completed at {record.startTime}");
                         await ProcessCallRecordAsync(record);
+
+                        // Помечаем как обработанный ТОЛЬКО после успешного завершения
+                        // (в том числе закономерных "не нашли лид"/"skip"), а не до
+                        // вызова — иначе сбой amoCRM внутри ProcessCallRecordAsync
+                        // навсегда потеряет звонок в пределах окна свежести: запись
+                        // уйдёт в _processedCallIds ещё ДО того, как заметка реально
+                        // создана, и повторный опрос её больше не тронет.
+                        _processedCallIds.Add(record.id);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error processing call record ID: {RecordId}", record.id);
+                        _logger.LogError(ex, "Error processing call record ID: {RecordId}, will retry on next poll", record.id);
                     }
                 }
 

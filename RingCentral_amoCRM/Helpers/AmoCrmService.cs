@@ -364,7 +364,10 @@ public class AmoCrmService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "NoteExistsAsync request failed for lead {LeadId}", leadId);
+                // Fail-open: сбой запроса к amoCRM не должен блокировать создание заметки.
+                // Редкий дубль при сбое API — меньшее зло, чем потерянный звонок/SMS,
+                // особенно с учётом узкого окна свежести и отсутствия повторных попыток.
+                _logger.LogWarning(ex, "NoteExistsAsync: request to amoCRM failed for lead {LeadId}, assuming note does not exist (fail-open)", leadId);
                 return false;
             }
 
@@ -375,7 +378,9 @@ public class AmoCrmService
 
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("NoteExistsAsync request failed for lead {LeadId}: {StatusCode}", leadId, response.StatusCode);
+                // Fail-open здесь же: 429/5xx/прочие ошибки amoCRM трактуются как
+                // "заметки не нашли", а не как "заметка точно есть".
+                _logger.LogWarning("NoteExistsAsync: amoCRM returned {StatusCode} for lead {LeadId}, assuming note does not exist (fail-open)", response.StatusCode, leadId);
                 return false;
             }
 
