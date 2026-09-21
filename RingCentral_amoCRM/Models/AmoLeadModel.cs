@@ -24,4 +24,19 @@ public class AmoCrmLeadDetail
 
     [JsonPropertyName("updated_at")]
     public long UpdatedAt { get; set; }
+
+    [JsonPropertyName("_embedded")]
+    public LeadContactsEmbedded Embedded { get; set; }
+}
+
+public class LeadContactsEmbedded
+{
+    [JsonPropertyName("contacts")]
+    public List<LeadContactRef> Contacts { get; set; }
+}
+
+public class LeadContactRef
+{
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
 }
