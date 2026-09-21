@@ -378,7 +378,7 @@ public class AmoCrmService
     // это как ошибку обработки звонка, а не как "заметки нет".
     public class NoteExistenceUnknownException : Exception
     {
-        public NoteExistenceUnknownException(string message, Exception inner = null)
+        public NoteExistenceUnknownException(string message, Exception? inner = null)
             : base(message, inner) { }
     }
 
