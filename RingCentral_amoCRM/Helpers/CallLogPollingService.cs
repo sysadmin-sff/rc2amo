@@ -247,7 +247,7 @@ public class CallLogPollingService : BackgroundService
 
             foreach (var leadId in leads)
             {
-                await _amoService.CreateCallNoteAsync(leadId, record, permanentRecordingUrl);
+                await _amoService.CreateCallNoteAsync(leadId, record, permanentRecordingUrl, searchNumber);
                 _logger.LogInformation("✅ Note added to lead {LeadId} for call from {From}", leadId, record.from.phoneNumber);
             }
         }

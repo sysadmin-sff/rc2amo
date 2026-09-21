@@ -569,7 +569,7 @@ public class AmoCrmService
         }
     }
 
-    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL)
+    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber)
     {
         const string entityType = "leads";
         const long responsibleUserId = 8644141;
@@ -580,7 +580,7 @@ public class AmoCrmService
             ["uniq"] = $"{record.id}",
             ["duration"] = record.duration,
             ["source"] = $"{(string.IsNullOrEmpty(record.from.extensionId) ? record.from.name : record.to.name)}",
-            ["phone"] = $"{record.from.phoneNumber}",
+            ["phone"] = $"{customerPhoneNumber}",
             ["call_responsible"] = $"{record.to.phoneNumber} - {record.to.name}"
         };
 
