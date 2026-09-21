@@ -24,6 +24,9 @@ public class CallLogPollingService : BackgroundService
     // Общий с LateAttachService (см. CallProcessingGuard).
     private readonly CallProcessingGuard _guard;
 
+    private readonly bool _lateAttachEnabled;
+    private readonly int _startupLookbackHours;
+
     public CallLogPollingService(
         IServiceProvider serviceProvider,
         ILogger<CallLogPollingService> logger,
@@ -51,6 +54,9 @@ public class CallLogPollingService : BackgroundService
         
         var expiresAtStr = configuration.GetSection("Credentials")["ExpiresAt"];
         _expiresAt = string.IsNullOrEmpty(expiresAtStr) ? DateTime.UtcNow : DateTime.Parse(expiresAtStr);
+
+        _lateAttachEnabled = configuration.GetValue("LateAttach:Enabled", true);
+        _startupLookbackHours = configuration.GetValue("LateAttach:StartupLookbackHours", 24);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -58,6 +64,23 @@ public class CallLogPollingService : BackgroundService
         await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
 
         _logger.LogInformation("🚀 CallLogPollingService starting...");
+
+        if (_lateAttachEnabled)
+        {
+            try
+            {
+                if (_amoService.IsExpired())
+                {
+                    await _amoService.InitializeAsync();
+                }
+                await EnsureAuthorized();
+                await RunStartupCatchUpAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Startup catch-up pass failed; continuing with regular polling.");
+            }
+        }
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -151,6 +174,68 @@ public class CallLogPollingService : BackgroundService
 
     private const int CallLogPageSize = 100;
     private const int CallLogMaxPages = 10;
+
+    // Однократный догоняющий проход при старте: основной опрос смотрит
+    // только ~5 минут назад, поэтому звонки существующим контактам за время
+    // простоя (рестарт/деплой) иначе теряются — поздняя привязка их не
+    // подберёт, т.к. эти контакты не менялись. Идемпотентность через uniq
+    // (NoteExistsAsync/guard) делает повторный проход безопасным.
+    private async Task RunStartupCatchUpAsync()
+    {
+        var dateFrom = DateTime.UtcNow.AddHours(-_startupLookbackHours);
+        _logger.LogInformation("Startup catch-up: fetching calls since {DateFrom}", dateFrom);
+
+        int totalFetched = 0;
+        for (int page = 1; page <= CallLogMaxPages; page++)
+        {
+            var callLogParameters = new ReadCompanyCallLogParameters()
+            {
+                perPage = CallLogPageSize,
+                page = page,
+                view = "Detailed",
+                withRecording = true,
+                dateFrom = dateFrom.ToString("o"),
+            };
+            var callLogs = await _rc.Restapi().Account().CallLog().List(callLogParameters);
+
+            if (callLogs?.records == null || callLogs.records.Length == 0)
+            {
+                break;
+            }
+
+            totalFetched += callLogs.records.Length;
+
+            foreach (var record in callLogs.records)
+            {
+                try
+                {
+                    if (record.from?.extensionId != null && record.to?.extensionId != null)
+                    {
+                        continue;
+                    }
+
+                    DateTime? callStartUtc = string.IsNullOrEmpty(record.startTime)
+                        ? null
+                        : DateTime.Parse(record.startTime, null,
+                            System.Globalization.DateTimeStyles.AdjustToUniversal |
+                            System.Globalization.DateTimeStyles.AssumeUniversal);
+
+                    await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Startup catch-up: error processing call {RecordId}", record.id);
+                }
+            }
+
+            if (callLogs.records.Length < CallLogPageSize)
+            {
+                break;
+            }
+        }
+
+        _logger.LogInformation("Startup catch-up complete: {Total} calls scanned", totalFetched);
+    }
 
     private async Task ProcessCallLogsAsync()
     {
