@@ -40,7 +40,25 @@ public class CallProcessingGuard
         }
 
         _processedCallIds.Clear();
-        _locks.Clear();
+
+        // Чистим только свободные семафоры. Держащийся сейчас семафор нельзя
+        // трогать: конкурентный AcquireAsync для того же call ID через
+        // GetOrAdd создаст новый семафор, и оба вызова окажутся внутри
+        // guarded-блока "проверка + создание" одновременно.
+        foreach (var kv in _locks)
+        {
+            if (kv.Value.CurrentCount == 1 && _locks.TryRemove(kv.Key, out var sem))
+            {
+                // Проиграли гонку с конкурентным AcquireAsync, который только
+                // что занял этот семафор — вернём его обратно, чтобы новый
+                // владелец его всё ещё нашёл.
+                if (sem.CurrentCount != 1)
+                {
+                    _locks.TryAdd(kv.Key, sem);
+                }
+            }
+        }
+
         _lastCleanup = DateTime.UtcNow;
     }
 

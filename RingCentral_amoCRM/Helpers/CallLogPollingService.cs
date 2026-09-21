@@ -175,6 +175,11 @@ public class CallLogPollingService : BackgroundService
     private const int CallLogPageSize = 100;
     private const int CallLogMaxPages = 10;
 
+    // Догоняющий проход при старте покрывает StartupLookbackHours (по
+    // умолчанию 24ч) — заметно более широкое окно, чем ~15 минут обычного
+    // поллинга, поэтому ему нужен собственный, больший предел страниц.
+    private const int StartupCatchUpMaxPages = 50;
+
     // Однократный догоняющий проход при старте: основной опрос смотрит
     // только ~5 минут назад, поэтому звонки существующим контактам за время
     // простоя (рестарт/деплой) иначе теряются — поздняя привязка их не
@@ -186,7 +191,9 @@ public class CallLogPollingService : BackgroundService
         _logger.LogInformation("Startup catch-up: fetching calls since {DateFrom}", dateFrom);
 
         int totalFetched = 0;
-        for (int page = 1; page <= CallLogMaxPages; page++)
+        bool lastPageWasFull = false;
+        int pagesFetched = 0;
+        for (int page = 1; page <= StartupCatchUpMaxPages; page++)
         {
             var callLogParameters = new ReadCompanyCallLogParameters()
             {
@@ -200,9 +207,11 @@ public class CallLogPollingService : BackgroundService
 
             if (callLogs?.records == null || callLogs.records.Length == 0)
             {
+                lastPageWasFull = false;
                 break;
             }
 
+            pagesFetched = page;
             totalFetched += callLogs.records.Length;
 
             foreach (var record in callLogs.records)
@@ -228,10 +237,18 @@ public class CallLogPollingService : BackgroundService
                 }
             }
 
-            if (callLogs.records.Length < CallLogPageSize)
+            lastPageWasFull = callLogs.records.Length == CallLogPageSize;
+            if (!lastPageWasFull)
             {
                 break;
             }
+        }
+
+        if (lastPageWasFull && pagesFetched == StartupCatchUpMaxPages)
+        {
+            _logger.LogWarning(
+                "Startup catch-up: hit page cap ({MaxPages} pages), some calls in the {Hours}h window may not have been scanned",
+                StartupCatchUpMaxPages, _startupLookbackHours);
         }
 
         _logger.LogInformation("Startup catch-up complete: {Total} calls scanned", totalFetched);

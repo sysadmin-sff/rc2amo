@@ -94,6 +94,11 @@ public class LateAttachService : BackgroundService
 
         try
         {
+            if (_amoService.IsExpired())
+            {
+                await _amoService.InitializeAsync();
+            }
+
             updatedContacts = await _amoService.GetUpdatedContactsAsync(sinceUtc);
             updatedLeads = await _amoService.GetUpdatedLeadsWithContactsAsync(sinceUtc);
         }
@@ -179,7 +184,11 @@ public class LateAttachService : BackgroundService
                 ? null
                 : ParseStartUtc(record.startTime);
 
-            _logger.LogInformation("LATE id={Id} number={Number} age_h={AgeH:F1}", record.id, record.to?.phoneNumber ?? record.from?.phoneNumber, ageHours);
+            var searchNumber = record.from?.extensionId == null
+                ? record.from?.phoneNumber
+                : record.to?.phoneNumber;
+
+            _logger.LogInformation("LATE id={Id} number={Number} age_h={AgeH:F1}", record.id, searchNumber, ageHours);
 
             CallProcessingResult result;
             try
@@ -267,19 +276,8 @@ public class LateAttachService : BackgroundService
             ? record.from.phoneNumber
             : record.to.phoneNumber;
 
-        var normalized = NormalizePhone(searchNumber);
+        var normalized = AmoCrmService.NormalizePhone(searchNumber);
         return normalized != null && phones.Contains(normalized);
-    }
-
-    private static string NormalizePhone(string phone)
-    {
-        if (string.IsNullOrWhiteSpace(phone))
-        {
-            return null;
-        }
-
-        var digits = new string(phone.Where(char.IsDigit).ToArray());
-        return digits.Length >= 10 ? digits[^10..] : null;
     }
 
     private static DateTime ParseStartUtc(string startTime)

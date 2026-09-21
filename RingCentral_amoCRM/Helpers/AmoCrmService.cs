@@ -604,7 +604,9 @@ public class AmoCrmService
 
     // Последние 10 цифр — минимальный общий знаменатель между форматами
     // amoCRM (+1XXXXXXXXXX/XXXXXXXXXX) и RingCentral (phoneNumber в call log).
-    private static string NormalizePhone(string phone)
+    // internal — переиспользуется в LateAttachService, чтобы не дублировать
+    // ту же логику.
+    internal static string NormalizePhone(string phone)
     {
         if (string.IsNullOrWhiteSpace(phone))
         {
