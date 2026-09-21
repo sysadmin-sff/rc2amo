@@ -8,6 +8,15 @@ using System.Text.Json.Nodes;
 using static System.Net.WebRequestMethods;
 using JsonSerializer = System.Text.Json.JsonSerializer;
 
+public enum CallProcessingResult
+{
+    Attached,
+    Duplicate,
+    NoLead,
+    NoNumber,
+    Error
+}
+
 public class AmoCrmService
 {
     private DateTime _tokenExpiration;
@@ -303,6 +312,13 @@ public class AmoCrmService
 
     private const long ClosedWonStatusId = 142;
     private const long ClosedLostStatusId = 143;
+
+    // Значения RingCentral CallLogRecord.result, означающие, что разговор не
+    // состоялся (звонок пропущен/не принят/ушёл на автоответчик и т.п.).
+    private static readonly HashSet<string> MissedCallResults = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Missed", "No Answer", "Voicemail", "Rejected", "Busy", "Abandoned"
+    };
 
     // Picks a single target lead out of a pool of candidates: prefers the most
     // recently updated OPEN lead (status not closed-won/closed-lost); if none
@@ -606,7 +622,7 @@ public class AmoCrmService
         }
     }
 
-    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed)
+    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed, DateTime? callStartUtc = null)
     {
         const string entityType = "leads";
         const long responsibleUserId = 8644141;
@@ -658,6 +674,79 @@ public class AmoCrmService
         {
             var err = await resp.Content.ReadAsStringAsync();
             _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}", resp.StatusCode, err);
+        }
+    }
+
+    // Единая точка обработки одного звонка. Вызывается и основным поллингом
+    // (record только что увиден, свежий), и поздней привязкой (record может
+    // быть до LateAttach:LookbackDays суток "старым"). logPrefix уходит в
+    // каждую лог-строку, чтобы различать источник в общем логе.
+    public async Task<CallProcessingResult> ProcessSingleCallAsync(
+        RingCentral.CallLogRecord record,
+        CallProcessingGuard guard,
+        string logPrefix,
+        DateTime? callStartUtc = null)
+    {
+        if (record.from == null || record.to == null)
+        {
+            _logger.LogWarning("{Prefix} id={Id} action=error reason=missing_from_or_to", logPrefix, record.id);
+            return CallProcessingResult.Error;
+        }
+
+        var searchNumber = record.from.extensionId == null
+            ? record.from.phoneNumber
+            : record.to.phoneNumber;
+
+        if (string.IsNullOrWhiteSpace(searchNumber))
+        {
+            _logger.LogWarning("{Prefix} id={Id} action=error reason=no_number", logPrefix, record.id);
+            return CallProcessingResult.NoNumber;
+        }
+
+        using (await guard.AcquireAsync(record.id))
+        {
+            if (guard.IsProcessed(record.id))
+            {
+                _logger.LogInformation("{Prefix} id={Id} number={Number} action=dup", logPrefix, record.id, searchNumber);
+                return CallProcessingResult.Duplicate;
+            }
+
+            var candidateLeads = await FindLeadByPhoneNumberAsync(searchNumber);
+            if (candidateLeads == null)
+            {
+                _logger.LogInformation("{Prefix} id={Id} number={Number} lead=none action=no_lead", logPrefix, record.id, searchNumber);
+                return CallProcessingResult.NoLead;
+            }
+
+            var targetLeadId = await ResolveTargetLeadAsync(candidateLeads);
+            if (targetLeadId == null)
+            {
+                _logger.LogInformation("{Prefix} id={Id} number={Number} lead=none action=no_lead", logPrefix, record.id, searchNumber);
+                return CallProcessingResult.NoLead;
+            }
+
+            var noteType = record.direction == "Inbound" ? "call_in" : "call_out";
+
+            if (await NoteExistsAsync(targetLeadId.Value, noteType, record.id))
+            {
+                guard.MarkProcessed(record.id);
+                _logger.LogInformation("{Prefix} id={Id} number={Number} lead={LeadId} action=dup", logPrefix, record.id, searchNumber, targetLeadId);
+                return CallProcessingResult.Duplicate;
+            }
+
+            string permanentRecordingUrl = null;
+            if (record.recording?.id != null)
+            {
+                permanentRecordingUrl = await UploadCallRecordingAsync(record.recording.id, record.id);
+            }
+
+            bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
+
+            await CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed, callStartUtc);
+            guard.MarkProcessed(record.id);
+
+            _logger.LogInformation("{Prefix} id={Id} number={Number} lead={LeadId} action=attached", logPrefix, record.id, searchNumber, targetLeadId);
+            return CallProcessingResult.Attached;
         }
     }
 }

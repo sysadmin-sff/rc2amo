@@ -24,13 +24,6 @@ public class CallLogPollingService : BackgroundService
     // Общий с LateAttachService (см. CallProcessingGuard).
     private readonly CallProcessingGuard _guard;
 
-    // Значения RingCentral CallLogRecord.result, означающие, что разговор не
-    // состоялся (звонок пропущен/не принят/ушёл на автоответчик и т.п.).
-    private static readonly HashSet<string> MissedCallResults = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Missed", "No Answer", "Voicemail", "Rejected", "Busy", "Abandoned"
-    };
-
     public CallLogPollingService(
         IServiceProvider serviceProvider,
         ILogger<CallLogPollingService> logger,
@@ -217,15 +210,7 @@ public class CallLogPollingService : BackgroundService
                         }
 
                         _logger.LogInformation($"Start processing call {record.id} call completed at {record.startTime}");
-                        await ProcessCallRecordAsync(record);
-
-                        // Помечаем как обработанный ТОЛЬКО после успешного завершения
-                        // (в том числе закономерных "не нашли лид"/"skip"), а не до
-                        // вызова — иначе сбой amoCRM внутри ProcessCallRecordAsync
-                        // навсегда потеряет звонок в пределах окна свежести: запись
-                        // уйдёт в guard ещё ДО того, как заметка реально
-                        // создана, и повторный опрос её больше не тронет.
-                        _guard.MarkProcessed(record.id);
+                        await _amoService.ProcessSingleCallAsync(record, _guard, "POLL");
                     }
                     catch (Exception ex)
                     {
@@ -250,70 +235,4 @@ public class CallLogPollingService : BackgroundService
         }
     }
 
-    private async Task ProcessCallRecordAsync(CallLogRecord record)
-    {
-        if (record.from == null || record.to == null)
-        {
-            _logger.LogWarning("Skipping call {RecordId}: missing from or to information", record.id);
-            return;
-        }
-
-        _logger.LogInformation($"Processing call: ID={record.id}, From={record.from}, To={record.to}, Direction={record.direction}, Result={record.result}, Duration={record.duration}s");
-
-        // Vneshniy abonent ne imeet extensionId: dlya vhodyashchih ishchem po from,
-        // dlya ishodyashchih (zvonit nash sotrudnik) - po to.
-        var searchNumber = record.from.extensionId == null
-            ? record.from.phoneNumber
-            : record.to.phoneNumber;
-
-        if (string.IsNullOrWhiteSpace(searchNumber))
-        {
-            _logger.LogWarning("Skipping call {RecordId}: no usable phone number to search", record.id);
-            return;
-        }
-
-        var candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
-        if (candidateLeads == null)
-        {
-            _logger.LogInformation("No leads found for phone number {Number}", searchNumber);
-            return;
-        }
-
-        var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
-        if (targetLeadId == null)
-        {
-            _logger.LogWarning("Could not resolve a target lead for call {RecordId} (number {Number})", record.id, searchNumber);
-            return;
-        }
-
-        var noteType = record.direction == "Inbound" ? "call_in" : "call_out";
-
-        if (await _amoService.NoteExistsAsync(targetLeadId.Value, noteType, record.id))
-        {
-            _logger.LogInformation("Call {RecordId} already has a note on lead {LeadId}, skipping", record.id, targetLeadId);
-            return;
-        }
-
-        // Загружаем запись в хранилище amoCRM для получения постоянной ссылки
-        string permanentRecordingUrl = null;
-
-        if (record.recording?.id != null)
-        {
-            permanentRecordingUrl = await _amoService.UploadCallRecordingAsync(record.recording.id, record.id);
-
-            if (string.IsNullOrEmpty(permanentRecordingUrl))
-            {
-                _logger.LogWarning("Failed to upload recording for call {CallId}, note will be created without recording link", record.id);
-            }
-        }
-        else
-        {
-            _logger.LogInformation("Call {CallId} has no recording", record.id);
-        }
-
-        bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
-
-        await _amoService.CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed);
-        _logger.LogInformation("✅ Note added to lead {LeadId} for call {RecordId} from {From}", targetLeadId, record.id, record.from.phoneNumber);
-    }
 }
