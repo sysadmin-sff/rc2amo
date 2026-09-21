@@ -229,7 +229,13 @@ public class CallLogPollingService : BackgroundService
                             System.Globalization.DateTimeStyles.AdjustToUniversal |
                             System.Globalization.DateTimeStyles.AssumeUniversal);
 
-                    await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc);
+                    // failClosed: true — это разовый проход при старте, следующего
+                    // шанса догнать конкретно эти звонки нет в рамках самого прохода,
+                    // но идемпотентность через uniq делает безопасным полагаться на
+                    // то, что не помеченный обработанным звонок подхватит либо
+                    // поздняя привязка (если для него позже появится контакт), либо
+                    // следующий деплой/рестарт повторит этот же проход.
+                    await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc, failClosed: true);
                 }
                 catch (Exception ex)
                 {
