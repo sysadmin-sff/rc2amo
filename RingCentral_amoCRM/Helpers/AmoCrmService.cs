@@ -954,7 +954,10 @@ public class AmoCrmService
         }
     }
 
-    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed, DateTime? callStartUtc = null)
+    // Возвращает true только при 2xx-ответе amoCRM на создание заметки.
+    // Вызывающий код (ProcessSingleCallAsync) обязан проверить результат —
+    // не-2xx не должен трактоваться как успех.
+    public async Task<bool> CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed, DateTime? callStartUtc = null)
     {
         const string entityType = "leads";
         const long responsibleUserId = 8644141;
@@ -1028,14 +1031,14 @@ public class AmoCrmService
 
         if (resp.IsSuccessStatusCode)
         {
-            _logger.LogInformation("✅ Note added to amoCRM (Lead ID: {LeadId}) successfully. Recording link: {HasLink}", 
+            _logger.LogInformation("✅ Note added to amoCRM (Lead ID: {LeadId}) successfully. Recording link: {HasLink}",
                 leadId, !string.IsNullOrEmpty(recURL) ? "included" : "not available");
+            return true;
         }
-        else
-        {
-            var err = await resp.Content.ReadAsStringAsync();
-            _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}", resp.StatusCode, err);
-        }
+
+        var err = await resp.Content.ReadAsStringAsync();
+        _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}", resp.StatusCode, err);
+        return false;
     }
 
     // Единая точка обработки одного звонка. Вызывается и основным поллингом
@@ -1125,7 +1128,18 @@ public class AmoCrmService
 
             bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
 
-            await CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed, callStartUtc);
+            bool noteCreated = await CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed, callStartUtc);
+            if (!noteCreated)
+            {
+                // Не помечаем guard.MarkProcessed — заметка не создана, звонок
+                // остаётся доступным для повторной попытки на следующем
+                // опросе/цикле/проходе. Дубль здесь невозможен: NoteExistsAsync
+                // на следующей попытке не найдёт заметку, т.к. её не существует.
+                _logger.LogWarning("{Prefix} id={Id} number={Number} lead={LeadId} action=error reason=note_create_failed",
+                    logPrefix, record.id, searchNumber, targetLeadId);
+                return CallProcessingResult.Error;
+            }
+
             guard.MarkProcessed(record.id);
 
             _logger.LogInformation("{Prefix} id={Id} number={Number} lead={LeadId} action=attached", logPrefix, record.id, searchNumber, targetLeadId);
