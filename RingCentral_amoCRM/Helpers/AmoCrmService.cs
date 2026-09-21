@@ -636,6 +636,14 @@ public class AmoCrmService
             source = $"{source} (пропущенный звонок)";
         }
 
+        // Человекочитаемая метка времени звонка в тексте — страховка на случай,
+        // если amoCRM скорректирует created_at для очень старых дат (типично
+        // для звонков, найденных поздней привязкой, возрастом до LookbackDays).
+        if (callStartUtc.HasValue)
+        {
+            source = $"{source} [звонок {callStartUtc.Value:dd.MM.yyyy HH:mm} UTC]";
+        }
+
         // Создаем объект params
         var paramsObject = new JsonObject
         {
@@ -652,14 +660,18 @@ public class AmoCrmService
             paramsObject["link"] = recURL;
         }
 
-        var rootJsonArray = new JsonArray
+        var noteObject = new JsonObject
         {
-            new JsonObject
-            {
-                ["note_type"] = record.direction == "Inbound" ? "call_in" : "call_out", 
-                ["params"] = paramsObject
-            }
+            ["note_type"] = record.direction == "Inbound" ? "call_in" : "call_out",
+            ["params"] = paramsObject
         };
+
+        if (callStartUtc.HasValue)
+        {
+            noteObject["created_at"] = ((DateTimeOffset)DateTime.SpecifyKind(callStartUtc.Value, DateTimeKind.Utc)).ToUnixTimeSeconds();
+        }
+
+        var rootJsonArray = new JsonArray { noteObject };
         
         var content = new StringContent(rootJsonArray.ToJsonString(), Encoding.UTF8, "application/json");
         var url = $"/api/v4/{entityType}/{leadId}/notes";
