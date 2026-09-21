@@ -569,17 +569,26 @@ public class AmoCrmService
         }
     }
 
-    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber)
+    public async Task CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed)
     {
         const string entityType = "leads";
         const long responsibleUserId = 8644141;
+
+        // amoCRM params для call_in/call_out ограничены документированным набором
+        // полей (uniq, duration, source, link, phone, call_responsible) — отдельного
+        // поля под статус звонка нет, поэтому пометка о пропущенном звонке идёт в source.
+        var source = string.IsNullOrEmpty(record.from.extensionId) ? record.from.name : record.to.name;
+        if (isMissed)
+        {
+            source = $"{source} (пропущенный звонок)";
+        }
 
         // Создаем объект params
         var paramsObject = new JsonObject
         {
             ["uniq"] = $"{record.id}",
             ["duration"] = record.duration,
-            ["source"] = $"{(string.IsNullOrEmpty(record.from.extensionId) ? record.from.name : record.to.name)}",
+            ["source"] = source,
             ["phone"] = $"{customerPhoneNumber}",
             ["call_responsible"] = $"{record.to.phoneNumber} - {record.to.name}"
         };

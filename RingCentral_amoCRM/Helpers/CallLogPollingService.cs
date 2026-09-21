@@ -18,9 +18,18 @@ public class CallLogPollingService : BackgroundService
 
     // Дедупликация: RingCentral отдаёт один и тот же звонок в нескольких соседних
     // опросах, пока он не выйдет из окна _recentCallWindow. Без этого набора
-    // в сделку падает несколько одинаковых заметок про один созвон.
+    // в сделку падает несколько одинаковых заметок про один созвон. Это
+    // быстрый pre-check в памяти перед обращением к amoCRM (NoteExistsAsync) —
+    // источник истины при рестарте сервиса именно amoCRM, а не этот HashSet.
     private readonly HashSet<string> _processedCallIds = new();
     private DateTime _lastProcessedCleanup = DateTime.UtcNow;
+
+    // Значения RingCentral CallLogRecord.result, означающие, что разговор не
+    // состоялся (звонок пропущен/не принят/ушёл на автоответчик и т.п.).
+    private static readonly HashSet<string> MissedCallResults = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Missed", "No Answer", "Voicemail", "Rejected", "Busy", "Abandoned"
+    };
 
     public CallLogPollingService(
         IServiceProvider serviceProvider,
@@ -145,18 +154,13 @@ public class CallLogPollingService : BackgroundService
         return timeSinceModified.TotalMinutes <= _recentCallWindow.TotalMinutes;
     }
 
+    private const int CallLogPageSize = 100;
+    private const int CallLogMaxPages = 10;
+
     private async Task ProcessCallLogsAsync()
     {
         try
         {
-            var callLogParameters = new ReadCompanyCallLogParameters()
-            {
-                perPage = 20,
-                view = "Detailed",
-                withRecording = true,
-            };
-            var callLogs = await _rc.Restapi().Account().CallLog().List(callLogParameters);
-
             // Набор обработанных ID чистим раз в сутки: окно свежести всего 5 минут,
             // так что старые записи держать смысла нет, а память расти не должна.
             if ((DateTime.UtcNow - _lastProcessedCleanup).TotalHours >= 24)
@@ -166,38 +170,72 @@ public class CallLogPollingService : BackgroundService
                 _lastProcessedCleanup = DateTime.UtcNow;
             }
 
-            if (callLogs?.records != null && callLogs.records.Length > 0)
+            // Окно выборки: чуть шире окна свежести звонка, с запасом на случай
+            // задержек в самом Call Log API.
+            var dateFrom = DateTime.UtcNow.Subtract(_recentCallWindow + TimeSpan.FromMinutes(10));
+
+            int totalFetched = 0;
+            for (int page = 1; page <= CallLogMaxPages; page++)
             {
-                _logger.LogInformation("📞 Fetched {Count} call log records", callLogs.records.Length);
+                var callLogParameters = new ReadCompanyCallLogParameters()
+                {
+                    perPage = CallLogPageSize,
+                    page = page,
+                    view = "Detailed",
+                    withRecording = true,
+                    dateFrom = dateFrom.ToString("o"),
+                };
+                var callLogs = await _rc.Restapi().Account().CallLog().List(callLogParameters);
+
+                if (callLogs?.records == null || callLogs.records.Length == 0)
+                {
+                    break;
+                }
+
+                totalFetched += callLogs.records.Length;
+                _logger.LogInformation("📞 Fetched {Count} call log records (page {Page})", callLogs.records.Length, page);
 
                 foreach (var record in callLogs.records)
                 {
                     try
                     {
-                        if (IsRecentCall(record))
-                        {
-                            if (_processedCallIds.Contains(record.id))
-                            {
-                                _logger.LogInformation($"Call {record.id} already processed, skipping duplicate");
-                                continue;
-                            }
-                            _processedCallIds.Add(record.id);
-
-                            _logger.LogInformation($"Start processing call {record.id} call completed at {record.startTime}");
-                            await ProcessCallRecordAsync(record);
-                        }
-                        else
+                        if (!IsRecentCall(record))
                         {
                             _logger.LogInformation($"Skipping old call {record.id}");
+                            continue;
                         }
+
+                        // Внутренний звонок: у обеих сторон есть extensionId,
+                        // значит это сотрудник-сотрудник, искать сделку не по чему.
+                        if (record.from?.extensionId != null && record.to?.extensionId != null)
+                        {
+                            _logger.LogInformation($"Skipping internal call {record.id} (employee-to-employee)");
+                            continue;
+                        }
+
+                        if (_processedCallIds.Contains(record.id))
+                        {
+                            _logger.LogInformation($"Call {record.id} already processed, skipping duplicate");
+                            continue;
+                        }
+                        _processedCallIds.Add(record.id);
+
+                        _logger.LogInformation($"Start processing call {record.id} call completed at {record.startTime}");
+                        await ProcessCallRecordAsync(record);
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Error processing call record ID: {RecordId}", record.id);
                     }
                 }
+
+                if (callLogs.records.Length < CallLogPageSize)
+                {
+                    break;
+                }
             }
-            else
+
+            if (totalFetched == 0)
             {
                 _logger.LogInformation("No call log records found.");
             }
@@ -224,36 +262,54 @@ public class CallLogPollingService : BackgroundService
             ? record.from.phoneNumber
             : record.to.phoneNumber;
 
-        var leads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
-
-        if (leads != null)
+        if (string.IsNullOrWhiteSpace(searchNumber))
         {
-            // Загружаем запись в хранилище amoCRM для получения постоянной ссылки
-            string permanentRecordingUrl = null;
-            
-            if (record.recording?.id != null)
-            {
-                permanentRecordingUrl = await _amoService.UploadCallRecordingAsync(record.recording.id, record.id);
-                
-                if (string.IsNullOrEmpty(permanentRecordingUrl))
-                {
-                    _logger.LogWarning("Failed to upload recording for call {CallId}, note will be created without recording link", record.id);
-                }
-            }
-            else
-            {
-                _logger.LogInformation("Call {CallId} has no recording", record.id);
-            }
+            _logger.LogWarning("Skipping call {RecordId}: no usable phone number to search", record.id);
+            return;
+        }
 
-            foreach (var leadId in leads)
+        var candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
+        if (candidateLeads == null)
+        {
+            _logger.LogInformation("No leads found for phone number {Number}", searchNumber);
+            return;
+        }
+
+        var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
+        if (targetLeadId == null)
+        {
+            _logger.LogWarning("Could not resolve a target lead for call {RecordId} (number {Number})", record.id, searchNumber);
+            return;
+        }
+
+        var noteType = record.direction == "Inbound" ? "call_in" : "call_out";
+
+        if (await _amoService.NoteExistsAsync(targetLeadId.Value, noteType, record.id))
+        {
+            _logger.LogInformation("Call {RecordId} already has a note on lead {LeadId}, skipping", record.id, targetLeadId);
+            return;
+        }
+
+        // Загружаем запись в хранилище amoCRM для получения постоянной ссылки
+        string permanentRecordingUrl = null;
+
+        if (record.recording?.id != null)
+        {
+            permanentRecordingUrl = await _amoService.UploadCallRecordingAsync(record.recording.id, record.id);
+
+            if (string.IsNullOrEmpty(permanentRecordingUrl))
             {
-                await _amoService.CreateCallNoteAsync(leadId, record, permanentRecordingUrl, searchNumber);
-                _logger.LogInformation("✅ Note added to lead {LeadId} for call from {From}", leadId, record.from.phoneNumber);
+                _logger.LogWarning("Failed to upload recording for call {CallId}, note will be created without recording link", record.id);
             }
         }
         else
         {
-            _logger.LogInformation("No leads found for phone number {Number}", searchNumber);
+            _logger.LogInformation("Call {CallId} has no recording", record.id);
         }
+
+        bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
+
+        await _amoService.CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed);
+        _logger.LogInformation("✅ Note added to lead {LeadId} for call {RecordId} from {From}", targetLeadId, record.id, record.from.phoneNumber);
     }
 }
