@@ -193,7 +193,7 @@ public class LateAttachService : BackgroundService
             CallProcessingResult result;
             try
             {
-                result = await _amoService.ProcessSingleCallAsync(record, _guard, "LATE", callStartUtc);
+                result = await _amoService.ProcessSingleCallAsync(record, _guard, "LATE", callStartUtc, failClosed: true);
             }
             catch (Exception ex)
             {
@@ -221,7 +221,20 @@ public class LateAttachService : BackgroundService
             "LATE cycle contacts={Contacts} leads={Leads} phones={Phones} calls_matched={Matched} attached={Attached} dup={Dup} errors={Errors} duration={Duration:F1}",
             contactsCount, leadsCount, phonesCount, matchedCount, attached, dup, errors, sw.Elapsed.TotalSeconds);
 
-        // Точка отсчёта продвигается только когда весь цикл дошёл до конца.
+        if (errors > 0)
+        {
+            // Хотя бы один звонок в цикле не удалось достоверно обработать
+            // (fail-closed NoteExistsAsync не смог проверить наличие заметки,
+            // либо ProcessSingleCallAsync упал по другой причине) — точку
+            // отсчёта не продвигаем. Следующий цикл пересмотрит те же
+            // изменения amoCRM; идемпотентность через uniq не даст
+            // задублировать уже созданные заметки.
+            _logger.LogWarning("LATE cycle had {Errors} error(s), cycle start point not advanced", errors);
+            return;
+        }
+
+        // Точка отсчёта продвигается только когда весь цикл дошёл до конца
+        // без ошибок обработки отдельных звонков.
         _lastCycleStartUtc = cycleStartUtc;
     }
 
