@@ -331,6 +331,69 @@ public class AmoCrmService
         return pool.OrderByDescending(l => l.UpdatedAt).First().Id;
     }
 
+    private const int NoteExistsMaxPages = 5;
+
+    // Checks whether a lead already has a note of the given type carrying
+    // params.uniq == uniqValue. amoCRM's notes endpoint has no server-side
+    // filter on custom params fields, so this scans notes filtered by type.
+    public async Task<bool> NoteExistsAsync(long leadId, string noteType, string uniqValue)
+    {
+        for (int page = 1; page <= NoteExistsMaxPages; page++)
+        {
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.GetAsync(
+                    $"/api/v4/leads/{leadId}/notes?filter[note_type]={Uri.EscapeDataString(noteType)}&limit=250&page={page}&order[updated_at]=desc");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "NoteExistsAsync request failed for lead {LeadId}", leadId);
+                return false;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
+            {
+                return false;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogError("NoteExistsAsync request failed for lead {LeadId}: {StatusCode}", leadId, response.StatusCode);
+                return false;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var notesResponse = JsonSerializer.Deserialize<AmoCrmNotesListResponse>(
+                json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            var notes = notesResponse?.Embedded?.Notes;
+            if (notes == null || notes.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (var note in notes)
+            {
+                if (note.Params.ValueKind == JsonValueKind.Object &&
+                    note.Params.TryGetProperty("uniq", out var uniqProp) &&
+                    uniqProp.ValueKind == JsonValueKind.String &&
+                    uniqProp.GetString() == uniqValue)
+                {
+                    return true;
+                }
+            }
+
+            if (notes.Count < 250)
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
     // Create a note attached to an entity (lead/contact). element_type: 1 = contact, 2 = lead
     public async Task CreateNoteAsync(long leadId, string noteText, string phone)
     {
