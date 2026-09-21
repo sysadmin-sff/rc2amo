@@ -354,6 +354,15 @@ public class AmoCrmService
     // filter on custom params fields, so this scans notes filtered by type.
     public async Task<bool> NoteExistsAsync(long leadId, string noteType, string uniqValue)
     {
+        // sms_in/sms_out notes never carry params.uniq (amoCRM rejects it with
+        // 400 FieldNotExpected on creation — see CreateNoteAsync), so scanning
+        // for a match would always come back empty. Skip the amoCRM round-trip
+        // entirely; SMS dedup relies solely on the in-memory _processedSmsIds set.
+        if (noteType == "sms_in" || noteType == "sms_out")
+        {
+            return false;
+        }
+
         for (int page = 1; page <= NoteExistsMaxPages; page++)
         {
             HttpResponseMessage response;
@@ -416,7 +425,11 @@ public class AmoCrmService
     }
 
     // Create an SMS note attached to a lead. noteType: "sms_in" or "sms_out".
-    // uniqId carries RingCentral's message id so NoteExistsAsync can dedupe.
+    // amoCRM rejects params.uniq for sms_in/sms_out (400 FieldNotExpected) —
+    // unlike call_in/call_out, this note type's params schema does not include
+    // it, so uniqId is NOT sent to amoCRM. It is only used for the log line
+    // below (to cross-reference against RingCentral's message id) and by the
+    // caller for the in-memory _processedSmsIds dedup check.
     public async Task CreateNoteAsync(long leadId, string noteText, string phone, string noteType, string uniqId)
     {
         const string entityType = "leads";
@@ -433,8 +446,7 @@ public class AmoCrmService
                 ["params"] = new JsonObject
                 {
                     ["text"] = $"{textPrefix} {phone}: {noteText}",
-                    ["phone"] = $"{phone}",
-                    ["uniq"] = uniqId
+                    ["phone"] = $"{phone}"
                 }
             }
         };
@@ -444,12 +456,12 @@ public class AmoCrmService
         var resp = await _httpClient.PostAsync(url, content);
         if (resp.IsSuccessStatusCode)
         {
-            _logger.LogInformation("Note added to amoCRM (Lead ID: {LeadId}) successfully.", leadId);
+            _logger.LogInformation("Note added to amoCRM (Lead ID: {LeadId}) successfully. RingCentral message id: {MessageId}", leadId, uniqId);
         }
         else
         {
             var err = await resp.Content.ReadAsStringAsync();
-            _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}", resp.StatusCode, err);
+            _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}. RingCentral message id: {MessageId}", resp.StatusCode, err, uniqId);
         }
     }
 
