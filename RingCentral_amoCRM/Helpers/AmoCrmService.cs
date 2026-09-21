@@ -444,10 +444,15 @@ public class AmoCrmService
     // updated_at не может быть раньше времени звонка" НЕ подтверждено
     // документацией amoCRM v4 — created_at как принимаемое поле при создании
     // заметки вообще не задокументирован официально (см. комментарий в
-    // CreateCallNoteAsync). Это чисто серверная оптимизация поверх основного
-    // скана по note_type, а не замена ему: если фильтр не даст ожидаемого
-    // эффекta, логика останется корректной, просто медленнее. Требует
-    // эмпирической проверки на реальном amoCRM-аккаунте.
+    // CreateCallNoteAsync). Поэтому фильтр применяется ТОЛЬКО при
+    // failClosed=false (основной поллинг): там ошибочно неверный результат
+    // означает редкий дубль — тот же риск, что и без фильтра. На fail-closed
+    // путях (LATE/STARTUP) фильтр НЕ применяется: если amoCRM отфильтрует
+    // существующую заметку на своей стороне (вернёт 200 OK с пустым/неполным
+    // списком вместо ошибки), NoteExistenceUnknownException не сработает и
+    // мы молча создадим дубль — ровно то, для защиты от чего fail-closed
+    // существует. Требует эмпирической проверки на реальном amoCRM-аккаунте;
+    // включить и для fail-closed путей можно только после подтверждения.
     public async Task<bool> NoteExistsAsync(
         long leadId,
         string noteType,
@@ -465,7 +470,7 @@ public class AmoCrmService
         }
 
         string updatedAtFilter = "";
-        if (notEarlierThanUtc.HasValue)
+        if (notEarlierThanUtc.HasValue && !failClosed)
         {
             var sinceUnix = ((DateTimeOffset)DateTime.SpecifyKind(notEarlierThanUtc.Value, DateTimeKind.Utc))
                 .AddHours(-1)
