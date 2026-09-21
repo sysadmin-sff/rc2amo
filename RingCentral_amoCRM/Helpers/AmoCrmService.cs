@@ -962,7 +962,15 @@ public class AmoCrmService
         // amoCRM params для call_in/call_out ограничены документированным набором
         // полей (uniq, duration, source, link, phone, call_responsible) — отдельного
         // поля под статус звонка нет, поэтому пометка о пропущенном звонке идёт в source.
+        // amoCRM требует params.source непустым (400 NotBlank/NotNullable) — RC не
+        // гарантирует name в CallLog для внешних абонентов без записи в адресной
+        // книге (это может быть null/пусто даже для валидного, обработанного
+        // звонка), так что запасное значение обязательно.
         var source = string.IsNullOrEmpty(record.from.extensionId) ? record.from.name : record.to.name;
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            source = "RingCentral";
+        }
         if (isMissed)
         {
             source = $"{source} (пропущенный звонок)";
