@@ -404,23 +404,29 @@ public class AmoCrmService
         TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)
     };
 
-    // /restapi/v1.0/account/~/recording/{id}/content — heavy-group эндпоинт RC.
-    // На проде при догоне (STARTUP, широкое окно) наблюдалось до 18 "Request rate
-    // exceeded" (CMN-301) подряд с Retry-After: 60 в ответе. RingCentral.Net (SDK)
-    // бросает RestException на любой не-2xx ответ, но не отдаёт статус-код/заголовки
-    // через публичный API (единственный конструктор кладёт HttpResponseMessage в
-    // приватное поле; публичных Response/StatusCode/Headers нет) — полагаться на
-    // reflection в приватные поля SDK означало бы завязаться на недокументированную
-    // деталь реализации конкретной версии пакета. Вместо этого достаём Retry-After
-    // из ex.Message: конструктор RestException форматирует его через
-    // HttpResponseMessage.ToString(), который (проверено эмпирически на .NET 8)
-    // включает блок "Headers: { ... }" со строкой "Retry-After: <секунды>" как есть —
-    // это то же текстовое представление, из которого читает Message, а не отдельный
-    // недокументированный контракт. Если распознать не удалось (SDK сменит формат
-    // ex.Message, или заголовка нет) — используем зафиксированное на проде значение
-    // 60с как безопасный запасной вариант.
-    private const int RecordingDownloadRetryMaxAttempts = 3;
-    private static readonly TimeSpan RecordingDownloadRetryFallbackDelay = TimeSpan.FromSeconds(60);
+    // Оба heavy-group эндпоинта RC, которые мы дёргаем —
+    // /restapi/v1.0/account/~/call-log (журнал звонков, все три пути: POLL,
+    // STARTUP, LATE) и /restapi/v1.0/account/~/recording/{id}/content (запись) —
+    // упираются в один и тот же жёсткий rate limit. На проде наблюдалось: при
+    // догоне (STARTUP, широкое окно) — до 18 "Request rate exceeded" (CMN-301)
+    // подряд на recording с Retry-After: 60; после того как на recording добавили
+    // retry, лимит стал доставаться call-log — все три сервиса стартуют почти
+    // одновременно и втроём выедают лимит на первом же запросе журнала звонков.
+    // RingCentral.Net (SDK) бросает RestException на любой не-2xx ответ, но не
+    // отдаёт статус-код/заголовки через публичный API (единственный конструктор
+    // кладёт HttpResponseMessage в приватное поле; публичных Response/StatusCode/
+    // Headers нет) — полагаться на reflection в приватные поля SDK означало бы
+    // завязаться на недокументированную деталь реализации конкретной версии
+    // пакета. Вместо этого достаём Retry-After из ex.Message: конструктор
+    // RestException форматирует его через HttpResponseMessage.ToString(), который
+    // (проверено эмпирически на .NET 8) включает блок "Headers: { ... }" со
+    // строкой "Retry-After: <секунды>" как есть — это то же текстовое
+    // представление, из которого читает Message, а не отдельный недокументированный
+    // контракт. Если распознать не удалось (SDK сменит формат ex.Message, или
+    // заголовка нет) — используем зафиксированное на проде значение 60с как
+    // безопасный запасной вариант.
+    private const int RcRetryMaxAttempts = 3;
+    private static readonly TimeSpan RcRetryFallbackDelay = TimeSpan.FromSeconds(60);
     private static readonly System.Text.RegularExpressions.Regex RetryAfterPattern =
         new(@"Retry-After:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
@@ -432,7 +438,7 @@ public class AmoCrmService
             return TimeSpan.FromSeconds(seconds);
         }
 
-        return RecordingDownloadRetryFallbackDelay;
+        return RcRetryFallbackDelay;
     }
 
     // Пауза между скачиваниями записей в пакетных путях (STARTUP catch-up,
@@ -884,37 +890,55 @@ public class AmoCrmService
         return false;
     }
 
-    // Скачивает запись из RingCentral с повтором на rate limit (CMN-301 "Request
-    // rate exceeded"), уважая Retry-After (см. GetRetryDelay). Максимум
-    // RecordingDownloadRetryMaxAttempts попыток.
-    private async Task<byte[]> DownloadRecordingWithRetryAsync(string recordingId)
+    // Общий повтор для любого вызова RingCentral.Net SDK, бросающего RestException
+    // на не-2xx (CallLog().List(...), Recording(...).Content().Get(), ...). Оба
+    // heavy-group эндпоинта — журнал звонков и запись разговора — упираются в один
+    // и тот же тип лимита RC (CMN-301 "Request rate exceeded", Retry-After), так
+    // что ретрай-логика одна на оба случая; opLabel уходит только в лог, чтобы
+    // различать, какой именно вызов повторяется.
+    public async Task<T> RunWithRcRetryAsync<T>(Func<Task<T>> action, string opLabel)
     {
-        for (int attempt = 1; attempt <= RecordingDownloadRetryMaxAttempts; attempt++)
+        for (int attempt = 1; attempt <= RcRetryMaxAttempts; attempt++)
         {
             try
             {
-                return await _rc.Restapi().Account().Recording(recordingId).Content().Get();
+                return await action();
             }
-            catch (RestException ex) when (IsRateLimitError(ex) && attempt < RecordingDownloadRetryMaxAttempts)
+            catch (RestException ex) when (IsRateLimitError(ex) && attempt < RcRetryMaxAttempts)
             {
                 var delay = GetRetryDelay(ex);
                 _logger.LogWarning(
-                    "Recording {RecordingId}: RingCentral rate limit (CMN-301), retrying in {Delay}s (attempt {Attempt}/{Max})",
-                    recordingId, delay.TotalSeconds, attempt, RecordingDownloadRetryMaxAttempts);
+                    "{OpLabel}: RingCentral rate limit (CMN-301), retrying in {Delay}s (attempt {Attempt}/{Max})",
+                    opLabel, delay.TotalSeconds, attempt, RcRetryMaxAttempts);
                 await Task.Delay(delay);
             }
         }
 
-        // Последняя попытка (attempt == RecordingDownloadRetryMaxAttempts) не
-        // попадает под when-условие catch выше и бросает исходное исключение
-        // наружу сама — сюда управление не доходит. Формальный fallback на
-        // случай будущих правок цикла: не удалось получить результат ни разу
-        // и не выброшено исключение (не должно происходить).
-        throw new InvalidOperationException($"DownloadRecordingWithRetryAsync({recordingId}): retry loop exited without a result");
+        // Последняя попытка (attempt == RcRetryMaxAttempts) не попадает под
+        // when-условие catch выше и бросает исходное исключение наружу сама —
+        // сюда управление не доходит.
+        throw new InvalidOperationException($"RunWithRcRetryAsync({opLabel}): retry loop exited without a result");
     }
+
+    // Скачивает запись из RingCentral с повтором на rate limit (CMN-301 "Request
+    // rate exceeded"), уважая Retry-After (см. GetRetryDelay). Максимум
+    // RcRetryMaxAttempts попыток.
+    private Task<byte[]> DownloadRecordingWithRetryAsync(string recordingId) =>
+        RunWithRcRetryAsync(
+            () => _rc.Restapi().Account().Recording(recordingId).Content().Get(),
+            $"Recording {recordingId}");
 
     private static bool IsRateLimitError(RestException ex) =>
         ex.Message.Contains("429") || ex.Message.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase);
+
+    // Публичная обёртка для вызывающего кода (CallLogPollingService,
+    // LateAttachService): после того как RunWithRcRetryAsync исчерпал попытки
+    // и пробросил исключение, это позволяет отличить в логе "RC так и не ответил
+    // из-за rate limit" от прочих сбоев (сеть, авторизация и т.п.) — CMN-301 после
+    // ретраев значит, что лимит выедается быстрее, чем мы успеваем его отпустить
+    // (см. RunWithRcRetryAsync), а не разовый временный сбой.
+    public static bool IsRcRateLimitException(Exception ex) =>
+        ex is RestException restEx && IsRateLimitError(restEx);
 
     // Возвращает исход отдельно от URL: RecordingUploadOutcome.NotAvailable —
     // у звонка на стороне RC нет записи (пустой контент); .Failed — скачивание
