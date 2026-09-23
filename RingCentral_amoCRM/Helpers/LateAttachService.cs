@@ -16,6 +16,7 @@ public class LateAttachService : BackgroundService
     private readonly TimeSpan _interval;
     private readonly int _lookbackDays;
     private readonly int _startupLookbackHours;
+    private readonly int _startupDelaySeconds;
 
     private DateTime? _lastCycleStartUtc;
 
@@ -39,9 +40,15 @@ public class LateAttachService : BackgroundService
         _lookbackDays = configuration.GetValue("LateAttach:LookbackDays", 14);
         _startupLookbackHours = configuration.GetValue("LateAttach:StartupLookbackHours", 24);
 
+        // Разносим старт с POLL (~10с) и STARTUP catch-up (по умолчанию 60с) во
+        // избежание одновременных запросов к heavy-group call-log эндпоинту RC при
+        // старте процесса — все три сервиса иначе бьют по одному rate limit почти
+        // синхронно. См. Startup:CatchUpDelaySeconds в CallLogPollingService.
+        _startupDelaySeconds = configuration.GetValue("Startup:LateAttachDelaySeconds", 120);
+
         _logger.LogInformation(
-            "LATE settings: enabled={Enabled} intervalMin={IntervalMin} lookbackDays={LookbackDays} startupLookbackH={StartupLookbackH}",
-            _enabled, _interval.TotalMinutes, _lookbackDays, _startupLookbackHours);
+            "LATE settings: enabled={Enabled} intervalMin={IntervalMin} lookbackDays={LookbackDays} startupLookbackH={StartupLookbackH} startupDelayS={StartupDelayS}",
+            _enabled, _interval.TotalMinutes, _lookbackDays, _startupLookbackHours, _startupDelaySeconds);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -52,7 +59,7 @@ public class LateAttachService : BackgroundService
             return;
         }
 
-        await Task.Delay(TimeSpan.FromSeconds(20), stoppingToken);
+        await Task.Delay(TimeSpan.FromSeconds(_startupDelaySeconds), stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -167,7 +174,11 @@ public class LateAttachService : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "LATE cycle: RingCentral call log request failed, cycle start point not advanced.");
+            // Точка отсчёта НЕ продвигается — тот же sinceUtc повторится в
+            // следующем цикле, изменения amoCRM не теряются (идемпотентность
+            // через uniq защищает от дублей на повторной обработке).
+            var reason = AmoCrmService.IsRcRateLimitException(ex) ? "rate_limit" : "call_log_failed";
+            _logger.LogError(ex, "LATE CYCLE aborted reason={Reason}, cycle start point not advanced.", reason);
             return;
         }
 
@@ -262,7 +273,9 @@ public class LateAttachService : BackgroundService
                 dateFrom = dateFrom.ToString("o"),
             };
 
-            var callLogs = await _rc.Restapi().Account().CallLog().List(parameters);
+            var callLogs = await _amoService.RunWithRcRetryAsync(
+                () => _rc.Restapi().Account().CallLog().List(parameters),
+                $"LATE call-log page={page}");
             if (callLogs?.records == null || callLogs.records.Length == 0)
             {
                 break;
