@@ -65,6 +65,7 @@ builder.Services.AddHttpClient("AmoCrmClient", client =>
         return handler;
     });
 
+builder.Services.AddSingleton<RcHeavyGroupRateLimiter>();
 builder.Services.AddSingleton<AmoCrmService>();
 builder.Services.AddSingleton<CallProcessingGuard>();
 builder.Services.AddScoped<SubscriptionService>();

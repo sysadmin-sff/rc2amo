@@ -60,6 +60,11 @@ public class AmoCrmService
     private readonly IConfiguration _configuration;
     private readonly RestClient _rc;
 
+    // Общий на процесс ограничитель heavy-group вызовов RC (call-log, запись
+    // разговора) — см. RcHeavyGroupRateLimiter. Используется внутри
+    // RunWithRcRetryAsync, единственной точки, откуда идут такие вызовы.
+    private readonly RcHeavyGroupRateLimiter _rcLimiter;
+
     // Быстрый pre-check в памяти для SMS (аналог _processedCallIds у звонков).
     // Живёт здесь, а не в контроллере, т.к. AmoCrmService — singleton, а
     // контроллер создаётся per-request. Источник истины при рестарте —
@@ -76,11 +81,12 @@ public class AmoCrmService
         }
     }
 
-    public AmoCrmService(IHttpClientFactory httpClientFactory, IConfiguration configuration, ILogger<AmoCrmService> logger, RestClient rc)
+    public AmoCrmService(IHttpClientFactory httpClientFactory, IConfiguration configuration, ILogger<AmoCrmService> logger, RestClient rc, RcHeavyGroupRateLimiter rcLimiter)
     {
         _configuration = configuration;
         _logger = logger;
         _rc = rc;
+        _rcLimiter = rcLimiter;
 
         _clientId = _configuration["AmoCrm:ClientId"];
         _clientSecret = _configuration["AmoCrm:ClientSecret"];
@@ -896,21 +902,33 @@ public class AmoCrmService
     // и тот же тип лимита RC (CMN-301 "Request rate exceeded", Retry-After), так
     // что ретрай-логика одна на оба случая; opLabel уходит только в лог, чтобы
     // различать, какой именно вызов повторяется.
+    //
+    // Каждая попытка проходит через RcHeavyGroupRateLimiter — единственный на
+    // процесс гейт для heavy-group вызовов. Без него разнесение стартов сервисов
+    // по времени (Startup:CatchUpDelaySeconds/LateAttachDelaySeconds) не спасало
+    // на проде: лимит heavy-group общий на аккаунт, а не по одному на сервис, и
+    // сервис, узнавший о 429 первым, ничего не сообщал остальным — те продолжали
+    // ходить в API и получали свои 429 независимо, потребляя тот же бюджет.
+    // Теперь Retry-After с любого 429 становится общим "не раньше чем" для всех
+    // следующих heavy-group вызовов процесса, откуда бы они ни шли.
     public async Task<T> RunWithRcRetryAsync<T>(Func<Task<T>> action, string opLabel)
     {
         for (int attempt = 1; attempt <= RcRetryMaxAttempts; attempt++)
         {
-            try
+            using (await _rcLimiter.AcquireAsync())
             {
-                return await action();
-            }
-            catch (RestException ex) when (IsRateLimitError(ex) && attempt < RcRetryMaxAttempts)
-            {
-                var delay = GetRetryDelay(ex);
-                _logger.LogWarning(
-                    "{OpLabel}: RingCentral rate limit (CMN-301), retrying in {Delay}s (attempt {Attempt}/{Max})",
-                    opLabel, delay.TotalSeconds, attempt, RcRetryMaxAttempts);
-                await Task.Delay(delay);
+                try
+                {
+                    return await action();
+                }
+                catch (RestException ex) when (IsRateLimitError(ex) && attempt < RcRetryMaxAttempts)
+                {
+                    var delay = GetRetryDelay(ex);
+                    _rcLimiter.ReportRateLimited(delay);
+                    _logger.LogWarning(
+                        "{OpLabel}: RingCentral rate limit (CMN-301), retrying in {Delay}s (attempt {Attempt}/{Max})",
+                        opLabel, delay.TotalSeconds, attempt, RcRetryMaxAttempts);
+                }
             }
         }
 
