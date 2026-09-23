@@ -58,7 +58,7 @@ public class LateAttachService : BackgroundService
         {
             try
             {
-                await RunCycleAsync();
+                await RunCycleAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -80,7 +80,7 @@ public class LateAttachService : BackgroundService
         }
     }
 
-    private async Task RunCycleAsync()
+    private async Task RunCycleAsync(CancellationToken stoppingToken)
     {
         var cycleStartUtc = DateTime.UtcNow;
         var sinceUtc = _lastCycleStartUtc ?? cycleStartUtc.AddHours(-_startupLookbackHours);
@@ -213,6 +213,14 @@ public class LateAttachService : BackgroundService
                 case CallProcessingResult.Error:
                     errors++;
                     break;
+            }
+
+            // Пауза между звонками с записью — та же причина, что и в startup
+            // catch-up: /recording/{id}/content — heavy-group эндпоинт RC, и
+            // цикл LateAttach может встретить несколько таких звонков подряд.
+            if (record.recording?.id != null)
+            {
+                await Task.Delay(AmoCrmService.RecordingDownloadBatchPause, stoppingToken);
             }
         }
 

@@ -74,7 +74,7 @@ public class CallLogPollingService : BackgroundService
                     await _amoService.InitializeAsync();
                 }
                 await EnsureAuthorized();
-                await RunStartupCatchUpAsync();
+                await RunStartupCatchUpAsync(stoppingToken);
             }
             catch (Exception ex)
             {
@@ -185,7 +185,7 @@ public class CallLogPollingService : BackgroundService
     // простоя (рестарт/деплой) иначе теряются — поздняя привязка их не
     // подберёт, т.к. эти контакты не менялись. Идемпотентность через uniq
     // (NoteExistsAsync/guard) делает повторный проход безопасным.
-    private async Task RunStartupCatchUpAsync()
+    private async Task RunStartupCatchUpAsync(CancellationToken stoppingToken)
     {
         var dateFrom = DateTime.UtcNow.AddHours(-_startupLookbackHours);
         _logger.LogInformation("Startup catch-up: fetching calls since {DateFrom}", dateFrom);
@@ -234,8 +234,19 @@ public class CallLogPollingService : BackgroundService
                     // но идемпотентность через uniq делает безопасным полагаться на
                     // то, что не помеченный обработанным звонок подхватит либо
                     // поздняя привязка (если для него позже появится контакт), либо
-                    // следующий деплой/рестарт повторит этот же проход.
+                    // следующий деплой/рестарт повторит этот же проход. По той же
+                    // причине неудачное скачивание записи (CMN-301 после повторов)
+                    // тоже откладывает звонок целиком, а не создаёт заметку без записи.
                     await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc, failClosed: true);
+
+                    // Пауза между звонками с записью — при догоне после простоя записей
+                    // много, а /recording/{id}/content — heavy-group эндпоинт RC с
+                    // жёстким rate limit. Без паузы догон сам провоцирует CMN-301 на
+                    // каждом следующем звонке подряд.
+                    if (record.recording?.id != null)
+                    {
+                        await Task.Delay(AmoCrmService.RecordingDownloadBatchPause, stoppingToken);
+                    }
                 }
                 catch (Exception ex)
                 {
