@@ -17,6 +17,35 @@ public enum CallProcessingResult
     Error
 }
 
+// Различает "у звонка не было записи" (RecordingId пуст — UploadCallRecordingAsync
+// вообще не вызывается) от "запись была, но скачать/загрузить не удалось" —
+// раньше оба случая давали одинаковый null/"Recording link: not available" в логах,
+// что маскировало причину пропажи записи (постоянный сбой RC rate-limit от
+// временного "у этого звонка правда нет записи").
+public enum RecordingUploadOutcome
+{
+    Uploaded,
+    NotAvailable,   // RC отдал пустой контент — записи нет на стороне RC
+    Failed          // скачивание/загрузка не удалось (после повторов) — запись,
+                     // предположительно, есть, но сейчас недоступна
+}
+
+public readonly struct RecordingUploadResult
+{
+    public RecordingUploadOutcome Outcome { get; }
+    public string Url { get; }
+
+    private RecordingUploadResult(RecordingUploadOutcome outcome, string url)
+    {
+        Outcome = outcome;
+        Url = url;
+    }
+
+    public static RecordingUploadResult Uploaded(string url) => new(RecordingUploadOutcome.Uploaded, url);
+    public static RecordingUploadResult NotAvailable() => new(RecordingUploadOutcome.NotAvailable, null);
+    public static RecordingUploadResult Failed() => new(RecordingUploadOutcome.Failed, null);
+}
+
 public class AmoCrmService
 {
     private DateTime _tokenExpiration;
@@ -374,6 +403,42 @@ public class AmoCrmService
     {
         TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)
     };
+
+    // /restapi/v1.0/account/~/recording/{id}/content — heavy-group эндпоинт RC.
+    // На проде при догоне (STARTUP, широкое окно) наблюдалось до 18 "Request rate
+    // exceeded" (CMN-301) подряд с Retry-After: 60 в ответе. RingCentral.Net (SDK)
+    // бросает RestException на любой не-2xx ответ, но не отдаёт статус-код/заголовки
+    // через публичный API (единственный конструктор кладёт HttpResponseMessage в
+    // приватное поле; публичных Response/StatusCode/Headers нет) — полагаться на
+    // reflection в приватные поля SDK означало бы завязаться на недокументированную
+    // деталь реализации конкретной версии пакета. Вместо этого достаём Retry-After
+    // из ex.Message: конструктор RestException форматирует его через
+    // HttpResponseMessage.ToString(), который (проверено эмпирически на .NET 8)
+    // включает блок "Headers: { ... }" со строкой "Retry-After: <секунды>" как есть —
+    // это то же текстовое представление, из которого читает Message, а не отдельный
+    // недокументированный контракт. Если распознать не удалось (SDK сменит формат
+    // ex.Message, или заголовка нет) — используем зафиксированное на проде значение
+    // 60с как безопасный запасной вариант.
+    private const int RecordingDownloadRetryMaxAttempts = 3;
+    private static readonly TimeSpan RecordingDownloadRetryFallbackDelay = TimeSpan.FromSeconds(60);
+    private static readonly System.Text.RegularExpressions.Regex RetryAfterPattern =
+        new(@"Retry-After:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static TimeSpan GetRetryDelay(RestException ex)
+    {
+        var match = RetryAfterPattern.Match(ex.Message ?? "");
+        if (match.Success && int.TryParse(match.Groups[1].Value, out var seconds) && seconds > 0)
+        {
+            return TimeSpan.FromSeconds(seconds);
+        }
+
+        return RecordingDownloadRetryFallbackDelay;
+    }
+
+    // Пауза между скачиваниями записей в пакетных путях (STARTUP catch-up,
+    // LateAttach), чтобы самим не создавать всплеск запросов к heavy-group
+    // эндпоинту записи — независимо от того, сработал ли retry выше.
+    public static readonly TimeSpan RecordingDownloadBatchPause = TimeSpan.FromSeconds(2);
 
     // Брошено NoteExistsAsync(failClosed: true), когда мы не смогли достоверно
     // проверить, есть ли уже заметка (сбой запроса, не-успешный статус после
@@ -819,19 +884,65 @@ public class AmoCrmService
         return false;
     }
 
-    public async Task<string> UploadCallRecordingAsync(string recordingId, string callId)
+    // Скачивает запись из RingCentral с повтором на rate limit (CMN-301 "Request
+    // rate exceeded"), уважая Retry-After (см. GetRetryDelay). Максимум
+    // RecordingDownloadRetryMaxAttempts попыток.
+    private async Task<byte[]> DownloadRecordingWithRetryAsync(string recordingId)
+    {
+        for (int attempt = 1; attempt <= RecordingDownloadRetryMaxAttempts; attempt++)
+        {
+            try
+            {
+                return await _rc.Restapi().Account().Recording(recordingId).Content().Get();
+            }
+            catch (RestException ex) when (IsRateLimitError(ex) && attempt < RecordingDownloadRetryMaxAttempts)
+            {
+                var delay = GetRetryDelay(ex);
+                _logger.LogWarning(
+                    "Recording {RecordingId}: RingCentral rate limit (CMN-301), retrying in {Delay}s (attempt {Attempt}/{Max})",
+                    recordingId, delay.TotalSeconds, attempt, RecordingDownloadRetryMaxAttempts);
+                await Task.Delay(delay);
+            }
+        }
+
+        // Последняя попытка (attempt == RecordingDownloadRetryMaxAttempts) не
+        // попадает под when-условие catch выше и бросает исходное исключение
+        // наружу сама — сюда управление не доходит. Формальный fallback на
+        // случай будущих правок цикла: не удалось получить результат ни разу
+        // и не выброшено исключение (не должно происходить).
+        throw new InvalidOperationException($"DownloadRecordingWithRetryAsync({recordingId}): retry loop exited without a result");
+    }
+
+    private static bool IsRateLimitError(RestException ex) =>
+        ex.Message.Contains("429") || ex.Message.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase);
+
+    // Возвращает исход отдельно от URL: RecordingUploadOutcome.NotAvailable —
+    // у звонка на стороне RC нет записи (пустой контент); .Failed — скачивание
+    // или загрузка не удались (в т.ч. после исчерпания повторов на rate limit) —
+    // запись, предположительно, есть, но сейчас недоступна. Раньше оба случая
+    // возвращали null неразличимо, и лог показывал одинаковое "Recording link:
+    // not available" для обеих ситуаций.
+    public async Task<RecordingUploadResult> UploadCallRecordingAsync(string recordingId, string callId)
     {
         try
         {
             _logger.LogInformation("Downloading recording {RecordingId} from RingCentral...", recordingId);
 
-            // Скачиваем запись из RingCentral
-            var recordingContent = await _rc.Restapi().Account().Recording(recordingId).Content().Get();
-            
+            byte[] recordingContent;
+            try
+            {
+                recordingContent = await DownloadRecordingWithRetryAsync(recordingId);
+            }
+            catch (RestException ex)
+            {
+                _logger.LogError(ex, "Recording {RecordingId}: download failed after retries", recordingId);
+                return RecordingUploadResult.Failed();
+            }
+
             if (recordingContent == null || recordingContent.Length == 0)
             {
                 _logger.LogWarning("Recording {RecordingId} is empty or not available", recordingId);
-                return null;
+                return RecordingUploadResult.NotAvailable();
             }
 
             _logger.LogInformation("Recording downloaded, size: {Size} bytes. Uploading to amoCRM drive...", recordingContent.Length);
@@ -841,17 +952,17 @@ public class AmoCrmService
             if (!accountResponse.IsSuccessStatusCode)
             {
                 _logger.LogError("Failed to get account drive_url: {StatusCode}", accountResponse.StatusCode);
-                return null;
+                return RecordingUploadResult.Failed();
             }
 
             var accountJson = await accountResponse.Content.ReadAsStringAsync();
             var accountData = JsonSerializer.Deserialize<JsonElement>(accountJson);
-            
+
             string driveUrl = accountData.GetProperty("drive_url").GetString();
             if (string.IsNullOrEmpty(driveUrl))
             {
                 _logger.LogError("Drive URL is empty in account response");
-                return null;
+                return RecordingUploadResult.Failed();
             }
 
             _logger.LogInformation("Got drive URL: {DriveUrl}", driveUrl);
@@ -879,7 +990,7 @@ public class AmoCrmService
             {
                 var error = await sessionResponse.Content.ReadAsStringAsync();
                 _logger.LogError("Failed to create upload session: {StatusCode} {Error}", sessionResponse.StatusCode, error);
-                return null;
+                return RecordingUploadResult.Failed();
             }
 
             var sessionJson = await sessionResponse.Content.ReadAsStringAsync();
@@ -909,7 +1020,7 @@ public class AmoCrmService
                 {
                     var error = await uploadResponse.Content.ReadAsStringAsync();
                     _logger.LogError("Failed to upload file part: {StatusCode} {Error}", uploadResponse.StatusCode, error);
-                    return null;
+                    return RecordingUploadResult.Failed();
                 }
 
                 var uploadJson = await uploadResponse.Content.ReadAsStringAsync();
@@ -933,7 +1044,7 @@ public class AmoCrmService
                     {
                         var downloadUrl = downloadHref.GetString();
                         _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}, Download URL: {DownloadUrl}", fileUuid, downloadUrl);
-                        return downloadUrl;
+                        return RecordingUploadResult.Uploaded(downloadUrl);
                     }
                     
                     _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}", fileUuid);
@@ -944,19 +1055,19 @@ public class AmoCrmService
             if (string.IsNullOrEmpty(fileUuid))
             {
                 _logger.LogError("Failed to get file UUID after upload");
-                return null;
+                return RecordingUploadResult.Failed();
             }
 
             // Если не получили download URL из ответа, формируем его вручную
             var finalDownloadUrl = $"{driveUrl}/download/{fileUuid}";
             _logger.LogInformation("✅ Recording uploaded to amoCRM drive: {Url}", finalDownloadUrl);
-            
-            return finalDownloadUrl;
+
+            return RecordingUploadResult.Uploaded(finalDownloadUrl);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error uploading recording {RecordingId} to amoCRM drive", recordingId);
-            return null;
+            return RecordingUploadResult.Failed();
         }
     }
 
@@ -1129,7 +1240,33 @@ public class AmoCrmService
             string permanentRecordingUrl = null;
             if (record.recording?.id != null)
             {
-                permanentRecordingUrl = await UploadCallRecordingAsync(record.recording.id, record.id);
+                var uploadResult = await UploadCallRecordingAsync(record.recording.id, record.id);
+
+                if (uploadResult.Outcome == RecordingUploadOutcome.Uploaded)
+                {
+                    permanentRecordingUrl = uploadResult.Url;
+                }
+                else if (uploadResult.Outcome == RecordingUploadOutcome.Failed)
+                {
+                    // failClosed (LATE/STARTUP) — есть следующий цикл/деплой: откладываем
+                    // звонок целиком, чтобы не потерять запись навсегда (заметка без
+                    // записи создаётся один раз и запись к ней потом уже не добавить).
+                    // Не failClosed (POLL, узкое 5-минутное окно, следующего шанса нет) —
+                    // как и раньше, создаём заметку без записи, чтобы не потерять звонок.
+                    if (failClosed)
+                    {
+                        _logger.LogWarning(
+                            "{Prefix} id={Id} number={Number} lead={LeadId} action=error reason=recording_download_failed",
+                            logPrefix, record.id, searchNumber, targetLeadId);
+                        return CallProcessingResult.Error;
+                    }
+
+                    _logger.LogWarning(
+                        "{Prefix} id={Id} number={Number} lead={LeadId} reason=recording_download_failed: creating note without recording (no next attempt in this path)",
+                        logPrefix, record.id, searchNumber, targetLeadId);
+                }
+                // RecordingUploadOutcome.NotAvailable — у звонка на стороне RC нет
+                // записи, ждать нечего, создаём заметку без ссылки как обычно.
             }
 
             bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
