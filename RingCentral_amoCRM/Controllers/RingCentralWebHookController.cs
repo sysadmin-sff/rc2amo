@@ -205,6 +205,7 @@ public class RingCentralWebHookController : ControllerBase
             notification.Body.ExtensionId, newCount, updatedCount, vmNewCount, vmUpdatedCount, string.Join(",", otherChanges.Select(c => c.Type)));
 
         _amoService.RecordSmsWebhookSummary(newCount, updatedCount, otherCount);
+        _amoService.RecordVoicemailWebhookSummary(vmNewCount, vmUpdatedCount);
 
         // Голосовая почта обрабатывается независимо от ветки SMS ниже: у
         // расширения может в одном уведомлении не быть новых SMS, но быть

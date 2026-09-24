@@ -91,11 +91,25 @@ public class AmoCrmService
     private int _smsSummaryUpdatedCount;
     private int _smsSummaryOtherCount;
 
+    // Отдельные счётчики для голосовой почты — своя пара newCount/updatedCount
+    // в том же вебхуке (см. HandleMessageStoreChangeAsync), но VoiceMail
+    // больше не попадает в otherChanges/_smsSummaryOtherCount (раньше
+    // попадал, пока голосовая почта не обрабатывалась отдельно) — без этих
+    // счётчиков объём голосовых пропал бы из часовой сводки совсем.
+    private int _voicemailSummaryNewCount;
+    private int _voicemailSummaryUpdatedCount;
+
     public void RecordSmsWebhookSummary(int newCount, int updatedCount, int otherCount)
     {
         if (newCount != 0) Interlocked.Add(ref _smsSummaryNewCount, newCount);
         if (updatedCount != 0) Interlocked.Add(ref _smsSummaryUpdatedCount, updatedCount);
         if (otherCount != 0) Interlocked.Add(ref _smsSummaryOtherCount, otherCount);
+    }
+
+    public void RecordVoicemailWebhookSummary(int newCount, int updatedCount)
+    {
+        if (newCount != 0) Interlocked.Add(ref _voicemailSummaryNewCount, newCount);
+        if (updatedCount != 0) Interlocked.Add(ref _voicemailSummaryUpdatedCount, updatedCount);
     }
 
     // Читает и обнуляет накопленные счётчики одним снимком (вызывается таймером
@@ -107,6 +121,13 @@ public class AmoCrmService
         var u = Interlocked.Exchange(ref _smsSummaryUpdatedCount, 0);
         var o = Interlocked.Exchange(ref _smsSummaryOtherCount, 0);
         return (n, u, o);
+    }
+
+    public (int New, int Updated) FlushVoicemailWebhookSummary()
+    {
+        var n = Interlocked.Exchange(ref _voicemailSummaryNewCount, 0);
+        var u = Interlocked.Exchange(ref _voicemailSummaryUpdatedCount, 0);
+        return (n, u);
     }
 
     // Курсор "с какого момента ещё не забирали исходящие SMS" на расширение
