@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using RingCentral;
 using RingCentral_amoCRM.Helpers;
 using RingCentral_amoCRM.Models;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -79,6 +80,84 @@ public class AmoCrmService
         {
             _processedSmsIds.Add(smsId);
         }
+    }
+
+    // Почасовая сводка по WEBHOOK-событиям message-store (не-instant фильтр,
+    // Sms:OutboundEnabled=false режим "только лог"). Объём может быть большим
+    // (167 доп. исходящих SMS за 3 дня на проде, плюс read/delete/status-change
+    // события на те же сообщения) — сводка вместо строки на каждое событие.
+    // Считается здесь (singleton), сбрасывается таймером в SmsWebhookSummaryService.
+    private int _smsSummaryNewCount;
+    private int _smsSummaryUpdatedCount;
+    private int _smsSummaryOtherCount;
+
+    public void RecordSmsWebhookSummary(int newCount, int updatedCount, int otherCount)
+    {
+        if (newCount != 0) Interlocked.Add(ref _smsSummaryNewCount, newCount);
+        if (updatedCount != 0) Interlocked.Add(ref _smsSummaryUpdatedCount, updatedCount);
+        if (otherCount != 0) Interlocked.Add(ref _smsSummaryOtherCount, otherCount);
+    }
+
+    // Читает и обнуляет накопленные счётчики одним снимком (вызывается таймером
+    // раз в час). Interlocked.Exchange, а не read+set — счётчики продолжают
+    // получать пополнения от вебхуков всё это время.
+    public (int New, int Updated, int Other) FlushSmsWebhookSummary()
+    {
+        var n = Interlocked.Exchange(ref _smsSummaryNewCount, 0);
+        var u = Interlocked.Exchange(ref _smsSummaryUpdatedCount, 0);
+        var o = Interlocked.Exchange(ref _smsSummaryOtherCount, 0);
+        return (n, u, o);
+    }
+
+    // Курсор "с какого момента ещё не забирали исходящие SMS" на расширение
+    // (extensionId из уведомления message-store). По умолчанию — UtcNow на
+    // момент первого уведомления по этому расширению, БЕЗ отступа назад:
+    // дедупликация исходящих — только _processedSmsIds в памяти (см. выше),
+    // при рестарте она пустая, и любой откат курсора назад означает повторную
+    // выборку уже обработанных сообщений с риском дублей в сделках. Пропустить
+    // немного исходящих SMS в узком окне рестарта безопаснее, чем задублировать
+    // заметки в amoCRM. Курсор — тоже только в памяти, тот же класс риска, что
+    // и _processedSmsIds (см. риск в описании задачи).
+    private readonly ConcurrentDictionary<string, DateTime> _outboundSmsCheckpoints = new();
+
+    // Возвращает нижнюю границу выборки для расширения и в том же вызове
+    // атомарно продвигает курсор вперёд до notificationLastUpdatedUtc (или
+    // UtcNow, если время из уведомления не пришло) — следующий вызов начнёт
+    // с этой точки, а не переспросит то же окно повторно. Один AddOrUpdate,
+    // а не read+write по отдельности — второе уведомление по тому же
+    // extensionId, пришедшее почти одновременно, не должно видеть/затирать
+    // промежуточное состояние.
+    public DateTime AdvanceOutboundSmsCheckpoint(string extensionId, DateTime? notificationLastUpdatedUtc)
+    {
+        // RC отдаёт lastUpdated с Z/offset, System.Text.Json должен вернуть Utc,
+        // но на всякий случай (см. класс проблем "startTime не как UTC" в
+        // истории проекта) — явно нормализуем: значение уходит дальше в
+        // ToString("o") для следующего запроса к RC, и Kind.Unspecified/Local
+        // там тихо даст неверную границу выборки.
+        var newCheckpoint = notificationLastUpdatedUtc.HasValue
+            ? (notificationLastUpdatedUtc.Value.Kind == DateTimeKind.Utc
+                ? notificationLastUpdatedUtc.Value
+                : notificationLastUpdatedUtc.Value.ToUniversalTime())
+            : DateTime.UtcNow;
+        DateTime previous = default;
+
+        _outboundSmsCheckpoints.AddOrUpdate(
+            extensionId,
+            addValueFactory: _ =>
+            {
+                // Первое уведомление по этому расширению: без отступа назад
+                // (см. риск дублей в описании задачи) — курсор стартует от
+                // текущего момента, а не от newCheckpoint из уведомления.
+                previous = DateTime.UtcNow;
+                return previous;
+            },
+            updateValueFactory: (_, existing) =>
+            {
+                previous = existing;
+                return newCheckpoint > existing ? newCheckpoint : existing;
+            });
+
+        return previous;
     }
 
     public AmoCrmService(IHttpClientFactory httpClientFactory, IConfiguration configuration, ILogger<AmoCrmService> logger, RestClient rc, RcHeavyGroupRateLimiter rcLimiter)
@@ -945,6 +1024,50 @@ public class AmoCrmService
         RunWithRcRetryAsync(
             () => _rc.Restapi().Account().Recording(recordingId).Content().Get(),
             $"Recording {recordingId}");
+
+    // Повтор на rate limit БЕЗ RcHeavyGroupRateLimiter — тот гейт настроен под
+    // heavy-group бюджет (10 запросов/мин на аккаунт, общий с call-log и
+    // recording/content, см. RcHeavyGroupRateLimiter). Список сообщений
+    // message-store — не heavy-group эндпоинт: по данным RC (и по объёму вызовов
+    // здесь — один на новое исходящее SMS, не polling) заводить его в общий с
+    // call-log/recording гейт не нужно и не должно тормозить оба независимых
+    // потока друг другом. Если это предположение окажется неверным на практике,
+    // повтор с уважением Retry-After (тот же GetRetryDelay/IsRateLimitError, что
+    // и у heavy-group) всё равно не даст тихо потерять сообщение — просто без
+    // координации с call-log/recording.
+    private async Task<T> RunWithLightRetryAsync<T>(Func<Task<T>> action, string opLabel)
+    {
+        for (int attempt = 1; attempt <= RcRetryMaxAttempts; attempt++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (RestException ex) when (IsRateLimitError(ex) && attempt < RcRetryMaxAttempts)
+            {
+                var delay = GetRetryDelay(ex);
+                _logger.LogWarning(
+                    "{OpLabel}: RingCentral rate limit, retrying in {Delay}s (attempt {Attempt}/{Max})",
+                    opLabel, delay.TotalSeconds, attempt, RcRetryMaxAttempts);
+                await Task.Delay(delay);
+            }
+        }
+
+        throw new InvalidOperationException($"RunWithLightRetryAsync({opLabel}): retry loop exited without a result");
+    }
+
+    // Забирает новые исходящие SMS для расширения начиная с sinceUtc (не
+    // включительно) — используется только когда Sms:OutboundEnabled=true и
+    // не-instant вебхук сообщил newCount>0 для SMS на этом расширении.
+    public Task<GetMessageList> FetchOutboundSmsAsync(string extensionId, DateTime sinceUtc) =>
+        RunWithLightRetryAsync(
+            () => _rc.Restapi().Account().Extension(extensionId).MessageStore().List(new ListMessagesParameters
+            {
+                direction = new[] { "Outbound" },
+                messageType = new[] { "SMS" },
+                dateFrom = sinceUtc.ToString("o")
+            }),
+            $"MessageStore.List(ext={extensionId})");
 
     private static bool IsRateLimitError(RestException ex) =>
         ex.Message.Contains("429") || ex.Message.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase);
