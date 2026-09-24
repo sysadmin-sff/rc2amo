@@ -17,6 +17,7 @@ public class RingCentralWebHookController : ControllerBase
     private readonly ILogger<RingCentralWebHookController> _logger;
     private readonly string _jwt;
     private readonly AmoCrmService _amoService;
+    private readonly bool _smsOutboundEnabled;
     private DateTime _expiresAt;
 
     public RingCentralWebHookController(
@@ -32,6 +33,13 @@ public class RingCentralWebHookController : ControllerBase
         var expiresAtStr = configuration.GetSection("Credentials")["ExpiresAt"];
         _expiresAt = string.IsNullOrEmpty(expiresAtStr) ? DateTime.UtcNow : DateTime.Parse(expiresAtStr);
         _amoService = amoService;
+
+        // По умолчанию выключено: новый (не-instant) фильтр подписки шлёт события
+        // и на новые исходящие SMS, и на read/delete/status-change существующих —
+        // при выключенном флаге всё это только логируется (см. HandleMessageStoreChangeAsync),
+        // ничего не создаётся в amoCRM. Включается Sms__OutboundEnabled=true в
+        // окружении после дня наблюдения за логами.
+        _smsOutboundEnabled = configuration.GetValue("Sms:OutboundEnabled", false);
     }
 
     private async Task EnsureAuthorized()
@@ -77,101 +85,229 @@ public class RingCentralWebHookController : ControllerBase
             return Ok();
         }
         Request.Body.Seek(0, SeekOrigin.Begin);
-    
+
         // Проверяем, есть ли что-то в потоке
         if (Request.ContentLength > 0)
         {
             var notificationJson = await new StreamReader(Request.Body).ReadToEndAsync();
+
+            // Не-instant фильтр (message-store?type=SMS&direction=Outbound) шлёт
+            // другую форму payload — сводку изменений (changes[].newCount/
+            // updatedCount), без id/from/to. Различаем по наличию "changes" в JSON
+            // до типизированного разбора, т.к. RingCentralNotification.Body для
+            // такого payload не заполнится (там нет полей instant-события).
+            if (notificationJson.Contains("\"changes\""))
+            {
+                return await HandleMessageStoreChangeAsync(notificationJson);
+            }
+
             var notification = System.Text.Json.JsonSerializer.Deserialize<RingCentralNotification>(notificationJson);
 
             if (notification?.Body == null)
             {
                 _logger.LogWarning("WebHook received (no validation token), but body was empty or invalid JSON. Returning 200 OK.");
-                return Ok(); 
+                return Ok();
             }
             if (notification?.Body != null)
             {
                 if ((notification.Body.Direction == "Inbound" || notification.Body.Direction == "Outbound") &&
                     notification.Body.Type == "SMS")
                 {
-                    string smsText = notification.Body.Subject;
-                    string senderName = notification.Body.From.Name;
-                    bool isOutbound = notification.Body.Direction == "Outbound";
-
-                    // Для исходящего SMS клиент — это получатель (To), а не From (это наш номер).
-                    string searchNumber = isOutbound
-                        ? notification.Body.To?.FirstOrDefault()?.PhoneNumber
-                        : notification.Body.From?.PhoneNumber;
-
-                    _logger.LogInformation("Received {Direction} SMS, searching by {SearchNumber} ({SenderName}). Text: {SmsText}",
-                        notification.Body.Direction, searchNumber, senderName, smsText);
-
-                    if (string.IsNullOrWhiteSpace(searchNumber))
-                    {
-                        _logger.LogWarning("SMS {Id}: no usable phone number to search, skipping", notification.Body.Id);
-                        return Ok();
-                    }
-
-                    if (_amoService.IsSmsProcessed(notification.Body.Id))
-                    {
-                        _logger.LogInformation("SMS {Id} already processed, skipping duplicate", notification.Body.Id);
-                        return Ok();
-                    }
-
-                    if (_amoService.IsExpired())
-                    {
-                        await _amoService.InitializeAsync();
-                    }
-
-                    // 1. Ищем ID сделок по номеру телефона
-                    IEnumerable<long> candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
-                    if (candidateLeads == null)
-                    {
-                        _logger.LogInformation("No leads found for SMS number {Number}", searchNumber);
-                        return Ok();
-                    }
-
-                    // 2. Выбираем одну сделку: открытую (самую свежую), иначе самую свежую из всех
-                    var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
-                    if (targetLeadId == null)
-                    {
-                        _logger.LogWarning("Could not resolve a target lead for SMS {Id}", notification.Body.Id);
-                        return Ok();
-                    }
-
-                    var noteType = isOutbound ? "sms_out" : "sms_in";
-
-                    // 3. Идемпотентность: не создаём заметку повторно, если она уже есть в amoCRM
-                    if (await _amoService.NoteExistsAsync(targetLeadId.Value, noteType, notification.Body.Id))
-                    {
-                        _logger.LogInformation("SMS {Id} already has a note on lead {LeadId}, skipping", notification.Body.Id, targetLeadId);
-                        _amoService.MarkSmsProcessed(notification.Body.Id);
-                        return Ok();
-                    }
-
-                    // 4. Формируем текст примечания
-                    string noteContent =
-                        $"\nКому: {(string.IsNullOrEmpty(notification.Body.To.First().Name) ? "Неизвестен" : notification.Body.To.First().Name)} ({notification.Body.To.First().PhoneNumber})\n" +
-                        $"от: {(string.IsNullOrEmpty(notification.Body.From.Name) ? "Неизвестен" : notification.Body.From.Name)} ({notification.Body.From.PhoneNumber})\n" +
-                        $"Сообщение: {smsText}";
-
-                    // 5. Добавляем примечание в карточку сделки
-                    bool smsNoteCreated = await _amoService.CreateNoteAsync(targetLeadId.Value, noteContent, searchNumber, noteType, notification.Body.Id);
-                    if (!smsNoteCreated)
-                    {
-                        // Не помечаем обработанным — заметка не создана, следующий
-                        // вебхук/ретрай от RC (если будет) сможет попробовать снова.
-                        _logger.LogWarning("SMS {Id} note creation failed, not marking as processed", notification.Body.Id);
-                        return Ok();
-                    }
-
-                    _amoService.MarkSmsProcessed(notification.Body.Id);
+                    // Instant-фильтр отдаёт только входящие (см. SubscriptionService) —
+                    // это условие исторически покрывало оба направления "на будущее",
+                    // но в реальности сюда приходит только Inbound. Оставляем как есть:
+                    // поведение входящих не меняем.
+                    await ProcessSmsMessageAsync(
+                        notification.Body.Id,
+                        notification.Body.Direction == "Outbound",
+                        notification.Body.To?.FirstOrDefault()?.PhoneNumber,
+                        notification.Body.To?.FirstOrDefault()?.Name,
+                        notification.Body.From?.PhoneNumber,
+                        notification.Body.From?.Name,
+                        notification.Body.Subject);
                     return Created();
                 }
             }
         }
 
-        return Ok(); 
+        return Ok();
+    }
+
+    // Обрабатывает уведомление от не-instant message-store фильтра (сводка
+    // изменений, добавлен для исходящих SMS — см. SubscriptionService). Логирует
+    // всегда (в т.ч. в лог-онли режиме и для не-SMS/не-новых изменений — почасовая
+    // сводка считает всё). Реальная выборка и создание заметок — только если
+    // Sms:OutboundEnabled=true И это новое (не read/delete/status-change) SMS.
+    private async Task<IActionResult> HandleMessageStoreChangeAsync(string notificationJson)
+    {
+        var notification = System.Text.Json.JsonSerializer.Deserialize<MessageStoreChangeNotification>(notificationJson);
+        var changes = notification?.Body?.Changes;
+
+        if (changes == null || changes.Count == 0)
+        {
+            _logger.LogWarning("WEBHOOK message-store notification with no changes[], body: {Body}", notificationJson);
+            return Ok();
+        }
+
+        var smsChange = changes.FirstOrDefault(c => c.Type == "SMS");
+        var otherChanges = changes.Where(c => c.Type != "SMS").ToList();
+
+        var newCount = smsChange?.NewCount ?? 0;
+        var updatedCount = smsChange?.UpdatedCount ?? 0;
+        var otherCount = otherChanges.Sum(c => (c.NewCount ?? 0) + (c.UpdatedCount ?? 0));
+
+        _logger.LogInformation(
+            "WEBHOOK event=message-store extId={ExtensionId} type=SMS new={NewCount} updated={UpdatedCount} otherTypes=[{OtherTypes}]",
+            notification.Body.ExtensionId, newCount, updatedCount, string.Join(",", otherChanges.Select(c => c.Type)));
+
+        _amoService.RecordSmsWebhookSummary(newCount, updatedCount, otherCount);
+
+        if (smsChange == null || newCount <= 0)
+        {
+            // Ничего нового: только read/delete/status-change на уже существующих
+            // SMS (updatedCount) и/или изменения других типов (vm/fax/pager) —
+            // не обрабатываем ни при каких условиях (см. задачу: голосовую почту
+            // и т.п. на этом этапе только логируем).
+            return Ok();
+        }
+
+        if (!_smsOutboundEnabled)
+        {
+            _logger.LogInformation(
+                "Sms:OutboundEnabled=false, not fetching {NewCount} new outbound SMS for extension {ExtensionId} (log-only)",
+                newCount, notification.Body.ExtensionId);
+            return Ok();
+        }
+
+        if (string.IsNullOrEmpty(notification.Body.ExtensionId))
+        {
+            _logger.LogWarning("WEBHOOK message-store notification missing extensionId, cannot fetch messages");
+            return Ok();
+        }
+
+        // Курсор продвигается ДО фетча: если он ниже упадёт (ошибка запроса),
+        // мы не должны повторно и бесконечно переспрашивать то же окно — та же
+        // логика "лучше пропустить, чем задублировать", что и для самого курсора
+        // (см. AdvanceOutboundSmsCheckpoint).
+        var sinceUtc = _amoService.AdvanceOutboundSmsCheckpoint(notification.Body.ExtensionId, notification.Body.LastUpdated);
+
+        GetMessageList fetched;
+        try
+        {
+            fetched = await _amoService.FetchOutboundSmsAsync(notification.Body.ExtensionId, sinceUtc);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to fetch outbound SMS for extension {ExtensionId} since {SinceUtc}", notification.Body.ExtensionId, sinceUtc);
+            return Ok();
+        }
+
+        var records = fetched?.records;
+        if (records == null || records.Length == 0)
+        {
+            _logger.LogInformation("MessageStore.List for extension {ExtensionId} since {SinceUtc} returned no records", notification.Body.ExtensionId, sinceUtc);
+            return Ok();
+        }
+
+        foreach (var msg in records)
+        {
+            if (msg.direction != "Outbound" || msg.type != "SMS")
+            {
+                continue; // на случай, если API вернул что-то за пределами фильтра
+            }
+
+            await ProcessSmsMessageAsync(
+                msg.id?.ToString(),
+                isOutbound: true,
+                toNumber: msg.to?.FirstOrDefault()?.phoneNumber,
+                toName: msg.to?.FirstOrDefault()?.name,
+                fromNumber: msg.from?.phoneNumber,
+                fromName: msg.from?.name,
+                smsText: msg.subject);
+        }
+
+        return Ok();
+    }
+
+    // Общая обработка одного SMS-сообщения (входящего или исходящего) —
+    // дедупликация, поиск сделки, создание заметки. Используется и instant-путём
+    // (входящие, сейчас единственный источник instant-событий), и выборкой через
+    // MessageStore().List() (исходящие, за флагом Sms:OutboundEnabled).
+    private async Task ProcessSmsMessageAsync(
+        string smsId,
+        bool isOutbound,
+        string toNumber,
+        string toName,
+        string fromNumber,
+        string fromName,
+        string smsText)
+    {
+        // Для исходящего SMS клиент — это получатель (to), а не from (это наш номер).
+        string searchNumber = isOutbound ? toNumber : fromNumber;
+
+        _logger.LogInformation("Processing {Direction} SMS {Id}, searching by {SearchNumber}. Text: {SmsText}",
+            isOutbound ? "Outbound" : "Inbound", smsId, searchNumber, smsText);
+
+        if (string.IsNullOrWhiteSpace(searchNumber))
+        {
+            _logger.LogWarning("SMS {Id}: no usable phone number to search, skipping", smsId);
+            return;
+        }
+
+        if (_amoService.IsSmsProcessed(smsId))
+        {
+            _logger.LogInformation("SMS {Id} already processed, skipping duplicate", smsId);
+            return;
+        }
+
+        if (_amoService.IsExpired())
+        {
+            await _amoService.InitializeAsync();
+        }
+
+        // 1. Ищем ID сделок по номеру телефона
+        IEnumerable<long> candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(searchNumber);
+        if (candidateLeads == null)
+        {
+            _logger.LogInformation("No leads found for SMS number {Number}", searchNumber);
+            return;
+        }
+
+        // 2. Выбираем одну сделку: открытую (самую свежую), иначе самую свежую из всех
+        var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
+        if (targetLeadId == null)
+        {
+            _logger.LogWarning("Could not resolve a target lead for SMS {Id}", smsId);
+            return;
+        }
+
+        var noteType = isOutbound ? "sms_out" : "sms_in";
+
+        // 3. Идемпотентность: не создаём заметку повторно, если она уже есть в amoCRM
+        if (await _amoService.NoteExistsAsync(targetLeadId.Value, noteType, smsId))
+        {
+            _logger.LogInformation("SMS {Id} already has a note on lead {LeadId}, skipping", smsId, targetLeadId);
+            _amoService.MarkSmsProcessed(smsId);
+            return;
+        }
+
+        // 4. Формируем текст примечания
+        string noteContent =
+            $"\nКому: {(string.IsNullOrEmpty(toName) ? "Неизвестен" : toName)} ({toNumber})\n" +
+            $"от: {(string.IsNullOrEmpty(fromName) ? "Неизвестен" : fromName)} ({fromNumber})\n" +
+            $"Сообщение: {smsText}";
+
+        // 5. Добавляем примечание в карточку сделки
+        bool smsNoteCreated = await _amoService.CreateNoteAsync(targetLeadId.Value, noteContent, searchNumber, noteType, smsId);
+        if (!smsNoteCreated)
+        {
+            // Не помечаем обработанным — заметка не создана, следующий
+            // вебхук/ретрай от RC (если будет) сможет попробовать снова.
+            _logger.LogWarning("SMS {Id} note creation failed, not marking as processed", smsId);
+            return;
+        }
+
+        _amoService.MarkSmsProcessed(smsId);
     }
 
     [HttpPost]

@@ -72,6 +72,7 @@ builder.Services.AddScoped<SubscriptionService>();
 builder.Services.AddHostedService<SubscriptionHostedService>();
 builder.Services.AddHostedService<CallLogPollingService>();
 builder.Services.AddHostedService<LateAttachService>();
+builder.Services.AddHostedService<SmsWebhookSummaryService>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
