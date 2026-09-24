@@ -79,44 +79,83 @@ public class SubscriptionService
         
         _logger.LogInformation("Attempting to create RingCentral WebHook subscription...");
         
-        // 1. Настройка фильтров событий
+        // 1. Настройка фильтров событий.
+        // instant-фильтр отдаёт только входящие SMS (RC: default/only direction
+        // для /message-store/instant — Inbound, см.
+        // developers.ringcentral.com/guide/notifications/event-filters/instant-message).
+        // Исходящие идут вторым, отдельным фильтром через обычный (не instant)
+        // message-store с direction=Outbound — см.
+        // developers.ringcentral.com/guide/notifications/event-filters/message.
+        // Это НЕ полная замена instant-фильтра: входящие продолжают идти как раньше,
+        // добавляется только вторая пара фильтров на исходящие.
+        var eventFilters = usersIds
+            .SelectMany(c => new[]
+            {
+                $"/restapi/v1.0/account/~/extension/{c}/message-store/instant?type=SMS",
+                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=SMS&direction=Outbound"
+            })
+            .ToArray();
+
         var subscriptionInfo = new CreateSubscriptionRequest
         {
-            // Подписываемся на события в хранилище сообщений для SMS
-            eventFilters = usersIds.Select(c => $"/restapi/v1.0/account/~/extension/{c}/message-store/instant?type=SMS").ToArray(),
-            
+            eventFilters = eventFilters,
+
             // 2. Настройка способа доставки (WebHook)
             deliveryMode = new NotificationDeliveryModeRequest()
             {
                 transportType = "WebHook",
                 address = WebHookUrl // Ваш публичный адрес!
             },
-            
+
             // 3. Срок действия (Максимум 7 дней, устанавливаем 6 дней в секундах)
-            expiresIn = 3600 * 24 * 6 
+            expiresIn = 3600 * 24 * 6
         };
 
         try
         {
-            if (subscriptions.records.Any())
+            // Важно: сначала создаём НОВУЮ подписку и только при её успехе удаляем
+            // старые. Раньше было наоборот (delete всех подписок, потом create) —
+            // если POST падал (например, из-за невалидного фильтра), аккаунт
+            // оставался вообще без подписки, и входящие SMS переставали приходить
+            // до следующего цикла обновления (раз в 5 дней/при рестарте).
+            var response = await _rc.Restapi().Subscription().Post(subscriptionInfo);
+
+            if (response == null || string.IsNullOrEmpty(response.id))
             {
-                foreach (var subscription in subscriptions.records)
+                _logger.LogError("❌ RingCentral вернул подписку без id — считаем создание неуспешным, старые подписки (если есть) не трогаем.");
+                return null;
+            }
+
+            _logger.LogInformation($"✅ Подписка успешно создана для аккаунтов {string.Join(",", usersIds)}!");
+            _logger.LogInformation($"ID: {response.id}, Истекает: {response.expirationTime}");
+
+            // Старые подписки удаляем только теперь, когда новая точно создана.
+            foreach (var subscription in subscriptions.records)
+            {
+                if (subscription.id == response.id)
+                {
+                    continue;
+                }
+
+                try
                 {
                     await _rc.Restapi().Subscription(subscription.id).Delete();
                 }
+                catch (Exception deleteEx)
+                {
+                    // Не критично: лишняя старая подписка продолжит существовать
+                    // (и в итоге истечёт сама), но новая уже работает — входящие
+                    // и исходящие SMS не пострадают.
+                    _logger.LogWarning(deleteEx, "Не удалось удалить старую подписку {SubscriptionId}, оставляем как есть.", subscription.id);
+                }
             }
-            // 4. Выполнение API-вызова для создания подписки
-            var response = await _rc.Restapi().Subscription().Post(subscriptionInfo);
-            
-            _logger.LogInformation($"✅ Подписка успешно создана для аккаунтов {string.Join(",", usersIds)}!");
-            _logger.LogInformation($"ID: {response.id}, Истекает: {response.expirationTime}");
-            
+
             // Сохраните ID подписки для последующего продления!
             return response.id;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Ошибка при создании подписки RingCentral. Убедитесь, что WebHook URL доступен.");
+            _logger.LogError(ex, "❌ Ошибка при создании подписки RingCentral. Убедитесь, что WebHook URL доступен. Старые подписки (если были) не тронуты.");
             return null;
         }
     }

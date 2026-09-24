@@ -155,3 +155,61 @@ public class RingCentralNotification
     [JsonPropertyName("body")]
     public MessageBody Body { get; set; }
 }
+
+
+// ----------------------------------------------------------------------
+// 4. Уведомление от НЕ-instant фильтра message-store
+//    (/restapi/v1.0/account/~/extension/{id}/message-store?type=SMS&direction=Outbound).
+//    В отличие от instant-события (см. MessageBody выше), это только сводка
+//    изменений в хранилище сообщений расширения — id/from/to/text здесь нет,
+//    сами сообщения нужно дозапрашивать через MessageStore().List().
+//    См. https://developers.ringcentral.com/guide/notifications/event-filters/message
+// ----------------------------------------------------------------------
+
+public class MessageStoreChange
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; }
+
+    [JsonPropertyName("newCount")]
+    public int? NewCount { get; set; }
+
+    [JsonPropertyName("updatedCount")]
+    public int? UpdatedCount { get; set; }
+}
+
+public class MessageStoreChangeBody
+{
+    [JsonPropertyName("extensionId")]
+    public string ExtensionId { get; set; }
+
+    [JsonPropertyName("accountId")]
+    public string AccountId { get; set; }
+
+    [JsonPropertyName("lastUpdated")]
+    public DateTime? LastUpdated { get; set; }
+
+    [JsonPropertyName("changes")]
+    public List<MessageStoreChange> Changes { get; set; }
+}
+
+public class MessageStoreChangeNotification
+{
+    [JsonPropertyName("uuid")]
+    public string Uuid { get; set; }
+
+    [JsonPropertyName("event")]
+    public string Event { get; set; }
+
+    [JsonPropertyName("timestamp")]
+    public DateTime Timestamp { get; set; }
+
+    [JsonPropertyName("subscriptionId")]
+    public string SubscriptionId { get; set; }
+
+    [JsonPropertyName("ownerId")]
+    public string OwnerId { get; set; }
+
+    [JsonPropertyName("body")]
+    public MessageStoreChangeBody Body { get; set; }
+}
