@@ -98,7 +98,22 @@ public class RingCentralWebHookController : ControllerBase
             // такого payload не заполнится (там нет полей instant-события).
             if (notificationJson.Contains("\"changes\""))
             {
-                return await HandleMessageStoreChangeAsync(notificationJson);
+                // HandleMessageStoreChangeAsync разбирает совершенно новый, никогда
+                // не проверенный на реальных данных payload (в отличие от instant-пути
+                // ниже) — если разбор или обработка упадёт с исключением, RingCentral
+                // должен всё равно получить 200 (иначе он начнёт повторную доставку,
+                // а мы точно так же упадём на повторе). try/catch здесь — последний
+                // рубеж на случай, если что-то внутри самого метода не поймает
+                // исключение (см. также catch внутри метода).
+                try
+                {
+                    return await HandleMessageStoreChangeAsync(notificationJson);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "HandleMessageStoreChangeAsync threw unhandled exception. WEBHOOK RAW {RawPayload}", notificationJson);
+                    return Ok();
+                }
             }
 
             var notification = System.Text.Json.JsonSerializer.Deserialize<RingCentralNotification>(notificationJson);
@@ -140,7 +155,22 @@ public class RingCentralWebHookController : ControllerBase
     // Sms:OutboundEnabled=true И это новое (не read/delete/status-change) SMS.
     private async Task<IActionResult> HandleMessageStoreChangeAsync(string notificationJson)
     {
-        var notification = System.Text.Json.JsonSerializer.Deserialize<MessageStoreChangeNotification>(notificationJson);
+        MessageStoreChangeNotification notification;
+        try
+        {
+            notification = System.Text.Json.JsonSerializer.Deserialize<MessageStoreChangeNotification>(notificationJson);
+        }
+        catch (Exception ex)
+        {
+            // Модель этого payload построена по документации RC, а не по реальному
+            // образцу (см. историю: упало на "Cannot get the value of a token type
+            // 'Number' as a string" в проде) — логируем сырой JSON целиком, чтобы
+            // можно было увидеть настоящую структуру и точно исправить модель,
+            // а не гадать по одному полю за раз.
+            _logger.LogError(ex, "Failed to deserialize message-store change notification. WEBHOOK RAW {RawPayload}", notificationJson);
+            return Ok();
+        }
+
         var changes = notification?.Body?.Changes;
 
         if (changes == null || changes.Count == 0)
