@@ -160,6 +160,57 @@ public class AmoCrmService
         return previous;
     }
 
+    // Курсор "с какого момента ещё не забирали голосовые сообщения" на
+    // расширение — тот же класс риска/то же поведение, что и
+    // _outboundSmsCheckpoints выше (см. комментарий там): только в памяти,
+    // без отступа назад при первом уведомлении по расширению, сбрасывается
+    // при рестарте. Отдельный словарь, а не переиспользование SMS-курсора:
+    // разные типы сообщений, разные окна выборки, самостоятельный сброс.
+    private readonly ConcurrentDictionary<string, DateTime> _voicemailCheckpoints = new();
+
+    public DateTime AdvanceVoicemailCheckpoint(string extensionId, DateTime? notificationLastUpdatedUtc)
+    {
+        var newCheckpoint = notificationLastUpdatedUtc.HasValue
+            ? (notificationLastUpdatedUtc.Value.Kind == DateTimeKind.Utc
+                ? notificationLastUpdatedUtc.Value
+                : notificationLastUpdatedUtc.Value.ToUniversalTime())
+            : DateTime.UtcNow;
+        DateTime previous = default;
+
+        _voicemailCheckpoints.AddOrUpdate(
+            extensionId,
+            addValueFactory: _ =>
+            {
+                previous = DateTime.UtcNow;
+                return previous;
+            },
+            updateValueFactory: (_, existing) =>
+            {
+                previous = existing;
+                return newCheckpoint > existing ? newCheckpoint : existing;
+            });
+
+        return previous;
+    }
+
+    // Быстрый pre-check в памяти для голосовых сообщений (аналог
+    // _processedSmsIds/_processedCallIds) — источник истины при рестарте
+    // остаётся NoteExistsAsync через amoCRM (uniq = id голосового сообщения
+    // RC, note_type="call_in" — в отличие от SMS, этот тип принимает uniq,
+    // так что дедупликация тут даже надёжнее, чем у SMS).
+    private readonly HashSet<string> _processedVoicemailIds = new();
+
+    public bool IsVoicemailProcessed(string voicemailId) =>
+        !string.IsNullOrEmpty(voicemailId) && _processedVoicemailIds.Contains(voicemailId);
+
+    public void MarkVoicemailProcessed(string voicemailId)
+    {
+        if (!string.IsNullOrEmpty(voicemailId))
+        {
+            _processedVoicemailIds.Add(voicemailId);
+        }
+    }
+
     public AmoCrmService(IHttpClientFactory httpClientFactory, IConfiguration configuration, ILogger<AmoCrmService> logger, RestClient rc, RcHeavyGroupRateLimiter rcLimiter)
     {
         _configuration = configuration;
@@ -1069,6 +1120,22 @@ public class AmoCrmService
             }),
             $"MessageStore.List(ext={extensionId})");
 
+    // Забирает новые голосовые сообщения для расширения начиная с sinceUtc —
+    // тот же паттерн, что и FetchOutboundSmsAsync (не-instant вебхук сообщил
+    // newCount>0 для VoiceMail на этом расширении, дальше дозапрашиваем сами
+    // сообщения через MessageStore().List()). direction не указываем —
+    // голосовая почта у RC всегда Inbound (пропущенный/переведённый на
+    // автоответчик звонок), фильтр по direction не нужен и не документирован
+    // как поддерживаемый для VoiceMail.
+    public Task<GetMessageList> FetchVoicemailsAsync(string extensionId, DateTime sinceUtc) =>
+        RunWithLightRetryAsync(
+            () => _rc.Restapi().Account().Extension(extensionId).MessageStore().List(new ListMessagesParameters
+            {
+                messageType = new[] { "VoiceMail" },
+                dateFrom = sinceUtc.ToString("o")
+            }),
+            $"MessageStore.List(ext={extensionId}, VoiceMail)");
+
     private static bool IsRateLimitError(RestException ex) =>
         ex.Message.Contains("429") || ex.Message.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase);
 
@@ -1110,128 +1177,183 @@ public class AmoCrmService
                 return RecordingUploadResult.NotAvailable();
             }
 
-            _logger.LogInformation("Recording downloaded, size: {Size} bytes. Uploading to amoCRM drive...", recordingContent.Length);
-
-            // Получаем drive_url для текущего аккаунта
-            var accountResponse = await _httpClient.GetAsync("/api/v4/account?with=drive_url");
-            if (!accountResponse.IsSuccessStatusCode)
-            {
-                _logger.LogError("Failed to get account drive_url: {StatusCode}", accountResponse.StatusCode);
-                return RecordingUploadResult.Failed();
-            }
-
-            var accountJson = await accountResponse.Content.ReadAsStringAsync();
-            var accountData = JsonSerializer.Deserialize<JsonElement>(accountJson);
-
-            string driveUrl = accountData.GetProperty("drive_url").GetString();
-            if (string.IsNullOrEmpty(driveUrl))
-            {
-                _logger.LogError("Drive URL is empty in account response");
-                return RecordingUploadResult.Failed();
-            }
-
-            _logger.LogInformation("Got drive URL: {DriveUrl}", driveUrl);
-
-            // Шаг 1: Создаем сессию загрузки
-            var sessionPayload = new
-            {
-                file_name = $"call_recording_{callId}.mp3",
-                file_size = recordingContent.Length,
-                content_type = "audio/mpeg"
-            };
-
-            var sessionContent = new StringContent(
-                JsonSerializer.Serialize(sessionPayload),
-                Encoding.UTF8,
-                "application/json");
-
-            using var driveClient = new HttpClient();
-            driveClient.Timeout = TimeSpan.FromMinutes(5);
-            driveClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization;
-
-            var sessionResponse = await driveClient.PostAsync($"{driveUrl}/v1.0/sessions", sessionContent);
-            
-            if (!sessionResponse.IsSuccessStatusCode)
-            {
-                var error = await sessionResponse.Content.ReadAsStringAsync();
-                _logger.LogError("Failed to create upload session: {StatusCode} {Error}", sessionResponse.StatusCode, error);
-                return RecordingUploadResult.Failed();
-            }
-
-            var sessionJson = await sessionResponse.Content.ReadAsStringAsync();
-            var session = JsonSerializer.Deserialize<JsonElement>(sessionJson);
-            
-            string uploadUrl = session.GetProperty("upload_url").GetString();
-            int maxPartSize = session.GetProperty("max_part_size").GetInt32();
-            string fileUuid = null;
-
-            _logger.LogInformation("Upload session created. Max part size: {MaxPartSize}", maxPartSize);
-
-            // Шаг 2: Загружаем файл по частям
-            int offset = 0;
-            string nextUrl = uploadUrl;
-            
-            while (offset < recordingContent.Length)
-            {
-                int partSize = Math.Min(maxPartSize, recordingContent.Length - offset);
-                var partContent = new ByteArrayContent(recordingContent, offset, partSize);
-                partContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("audio/mpeg");
-
-                _logger.LogInformation("Uploading part: offset={Offset}, size={PartSize}", offset, partSize);
-
-                var uploadResponse = await driveClient.PostAsync(nextUrl, partContent);
-                
-                if (!uploadResponse.IsSuccessStatusCode)
-                {
-                    var error = await uploadResponse.Content.ReadAsStringAsync();
-                    _logger.LogError("Failed to upload file part: {StatusCode} {Error}", uploadResponse.StatusCode, error);
-                    return RecordingUploadResult.Failed();
-                }
-
-                var uploadJson = await uploadResponse.Content.ReadAsStringAsync();
-                var uploadResult = JsonSerializer.Deserialize<JsonElement>(uploadJson);
-
-                // Если есть next_url - продолжаем загрузку
-                if (uploadResult.TryGetProperty("next_url", out var nextUrlElement))
-                {
-                    nextUrl = nextUrlElement.GetString();
-                    offset += partSize;
-                }
-                else
-                {
-                    // Это последняя часть - получаем UUID файла и download link
-                    fileUuid = uploadResult.GetProperty("uuid").GetString();
-                    
-                    // Получаем ссылку на скачивание из _links
-                    if (uploadResult.TryGetProperty("_links", out var links) &&
-                        links.TryGetProperty("download", out var downloadLink) &&
-                        downloadLink.TryGetProperty("href", out var downloadHref))
-                    {
-                        var downloadUrl = downloadHref.GetString();
-                        _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}, Download URL: {DownloadUrl}", fileUuid, downloadUrl);
-                        return RecordingUploadResult.Uploaded(downloadUrl);
-                    }
-                    
-                    _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}", fileUuid);
-                    break;
-                }
-            }
-
-            if (string.IsNullOrEmpty(fileUuid))
-            {
-                _logger.LogError("Failed to get file UUID after upload");
-                return RecordingUploadResult.Failed();
-            }
-
-            // Если не получили download URL из ответа, формируем его вручную
-            var finalDownloadUrl = $"{driveUrl}/download/{fileUuid}";
-            _logger.LogInformation("✅ Recording uploaded to amoCRM drive: {Url}", finalDownloadUrl);
-
-            return RecordingUploadResult.Uploaded(finalDownloadUrl);
+            return await UploadBytesToAmoDriveAsync(recordingContent, $"call_recording_{callId}.mp3", "audio/mpeg");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error uploading recording {RecordingId} to amoCRM drive", recordingId);
+            return RecordingUploadResult.Failed();
+        }
+    }
+
+    // Общая часть UploadCallRecordingAsync/UploadVoicemailRecordingAsync:
+    // байты уже скачаны с RC (это специфично для звонка/голосового и
+    // остаётся в каждом из них), дальше — одинаковая загрузка в amoCRM Drive
+    // (сессия → части → download-ссылка). Извлечено без изменения логики —
+    // тело метода перенесено как есть из UploadCallRecordingAsync.
+    private async Task<RecordingUploadResult> UploadBytesToAmoDriveAsync(byte[] content, string fileName, string contentType)
+    {
+        _logger.LogInformation("Content downloaded, size: {Size} bytes. Uploading to amoCRM drive...", content.Length);
+
+        // Получаем drive_url для текущего аккаунта
+        var accountResponse = await _httpClient.GetAsync("/api/v4/account?with=drive_url");
+        if (!accountResponse.IsSuccessStatusCode)
+        {
+            _logger.LogError("Failed to get account drive_url: {StatusCode}", accountResponse.StatusCode);
+            return RecordingUploadResult.Failed();
+        }
+
+        var accountJson = await accountResponse.Content.ReadAsStringAsync();
+        var accountData = JsonSerializer.Deserialize<JsonElement>(accountJson);
+
+        string driveUrl = accountData.GetProperty("drive_url").GetString();
+        if (string.IsNullOrEmpty(driveUrl))
+        {
+            _logger.LogError("Drive URL is empty in account response");
+            return RecordingUploadResult.Failed();
+        }
+
+        _logger.LogInformation("Got drive URL: {DriveUrl}", driveUrl);
+
+        // Шаг 1: Создаем сессию загрузки
+        var sessionPayload = new
+        {
+            file_name = fileName,
+            file_size = content.Length,
+            content_type = contentType
+        };
+
+        var sessionContent = new StringContent(
+            JsonSerializer.Serialize(sessionPayload),
+            Encoding.UTF8,
+            "application/json");
+
+        using var driveClient = new HttpClient();
+        driveClient.Timeout = TimeSpan.FromMinutes(5);
+        driveClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization;
+
+        var sessionResponse = await driveClient.PostAsync($"{driveUrl}/v1.0/sessions", sessionContent);
+
+        if (!sessionResponse.IsSuccessStatusCode)
+        {
+            var error = await sessionResponse.Content.ReadAsStringAsync();
+            _logger.LogError("Failed to create upload session: {StatusCode} {Error}", sessionResponse.StatusCode, error);
+            return RecordingUploadResult.Failed();
+        }
+
+        var sessionJson = await sessionResponse.Content.ReadAsStringAsync();
+        var session = JsonSerializer.Deserialize<JsonElement>(sessionJson);
+
+        string uploadUrl = session.GetProperty("upload_url").GetString();
+        int maxPartSize = session.GetProperty("max_part_size").GetInt32();
+        string fileUuid = null;
+
+        _logger.LogInformation("Upload session created. Max part size: {MaxPartSize}", maxPartSize);
+
+        // Шаг 2: Загружаем файл по частям
+        int offset = 0;
+        string nextUrl = uploadUrl;
+
+        while (offset < content.Length)
+        {
+            int partSize = Math.Min(maxPartSize, content.Length - offset);
+            var partContent = new ByteArrayContent(content, offset, partSize);
+            partContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+
+            _logger.LogInformation("Uploading part: offset={Offset}, size={PartSize}", offset, partSize);
+
+            var uploadResponse = await driveClient.PostAsync(nextUrl, partContent);
+
+            if (!uploadResponse.IsSuccessStatusCode)
+            {
+                var error = await uploadResponse.Content.ReadAsStringAsync();
+                _logger.LogError("Failed to upload file part: {StatusCode} {Error}", uploadResponse.StatusCode, error);
+                return RecordingUploadResult.Failed();
+            }
+
+            var uploadJson = await uploadResponse.Content.ReadAsStringAsync();
+            var uploadResult = JsonSerializer.Deserialize<JsonElement>(uploadJson);
+
+            // Если есть next_url - продолжаем загрузку
+            if (uploadResult.TryGetProperty("next_url", out var nextUrlElement))
+            {
+                nextUrl = nextUrlElement.GetString();
+                offset += partSize;
+            }
+            else
+            {
+                // Это последняя часть - получаем UUID файла и download link
+                fileUuid = uploadResult.GetProperty("uuid").GetString();
+
+                // Получаем ссылку на скачивание из _links
+                if (uploadResult.TryGetProperty("_links", out var links) &&
+                    links.TryGetProperty("download", out var downloadLink) &&
+                    downloadLink.TryGetProperty("href", out var downloadHref))
+                {
+                    var downloadUrl = downloadHref.GetString();
+                    _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}, Download URL: {DownloadUrl}", fileUuid, downloadUrl);
+                    return RecordingUploadResult.Uploaded(downloadUrl);
+                }
+
+                _logger.LogInformation("✅ File uploaded successfully. UUID: {FileUuid}", fileUuid);
+                break;
+            }
+        }
+
+        if (string.IsNullOrEmpty(fileUuid))
+        {
+            _logger.LogError("Failed to get file UUID after upload");
+            return RecordingUploadResult.Failed();
+        }
+
+        // Если не получили download URL из ответа, формируем его вручную
+        var finalDownloadUrl = $"{driveUrl}/download/{fileUuid}";
+        _logger.LogInformation("✅ Recording uploaded to amoCRM drive: {Url}", finalDownloadUrl);
+
+        return RecordingUploadResult.Uploaded(finalDownloadUrl);
+    }
+
+    // Скачивает содержимое вложения голосового сообщения (аудио, вложение
+    // типа AudioRecording) и загружает его в amoCRM Drive — переиспользует
+    // ту же сессию/цикл multi-part upload, что и UploadCallRecordingAsync
+    // для записей звонков (проверено по RingCentral.Net.dll: оба метода,
+    // Account().Recording(id).Content().Get() и
+    // Account().Extension(extId).MessageStore(messageId).Content(attachmentId).Get(),
+    // возвращают Task<byte[]> — общий формат, разные эндпоинты). Отдельный
+    // метод, а не переиспользование UploadCallRecordingAsync целиком: тот
+    // читает recordingId сам по себе (/recording/{id}/content), у голосовой
+    // почты аудио лежит под attachment id внутри конкретного сообщения
+    // расширения (/extension/{extId}/message-store/{messageId}/content/{attachmentId}).
+    public async Task<RecordingUploadResult> UploadVoicemailRecordingAsync(string extensionId, string messageId, string attachmentId)
+    {
+        try
+        {
+            _logger.LogInformation("Downloading voicemail attachment {AttachmentId} (message {MessageId}) from RingCentral...", attachmentId, messageId);
+
+            byte[] recordingContent;
+            try
+            {
+                recordingContent = await RunWithRcRetryAsync(
+                    () => _rc.Restapi().Account().Extension(extensionId).MessageStore(messageId).Content(attachmentId).Get(),
+                    $"VoicemailContent {messageId}/{attachmentId}");
+            }
+            catch (RestException ex)
+            {
+                _logger.LogError(ex, "Voicemail {MessageId}: attachment download failed after retries", messageId);
+                return RecordingUploadResult.Failed();
+            }
+
+            if (recordingContent == null || recordingContent.Length == 0)
+            {
+                _logger.LogWarning("Voicemail {MessageId} attachment is empty or not available", messageId);
+                return RecordingUploadResult.NotAvailable();
+            }
+
+            return await UploadBytesToAmoDriveAsync(recordingContent, $"voicemail_{messageId}.mp3", "audio/mpeg");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error uploading voicemail attachment {AttachmentId} (message {MessageId}) to amoCRM drive", attachmentId, messageId);
             return RecordingUploadResult.Failed();
         }
     }
@@ -1320,6 +1442,93 @@ public class AmoCrmService
 
         var err = await resp.Content.ReadAsStringAsync();
         _logger.LogError("Failed to add note: {StatusCode} {ErrorBody}", resp.StatusCode, err);
+        return false;
+    }
+
+    // Создаёт заметку по голосовому сообщению. note_type="call_in" (решение
+    // принято явно, не common): только call_in/call_out принимают
+    // params.uniq и params.link в amoCRM v4 (common — только text), так что
+    // это единственный тип с рабочей дедупликацией через NoteExistsAsync и
+    // полем под ссылку на запись. Компромисс: голосовые попадут в статистику
+    // звонков amoCRM — текст заметки поэтому явно начинается с пометки, что
+    // это голосовое, а не разговор.
+    //
+    // transcript — null/пусто, если vmTranscriptionStatus != Completed или
+    // вложения AudioTranscription не было (см. задачу: часть голосовых на
+    // проде без текста, код обязан работать и без него).
+    public async Task<bool> CreateVoicemailNoteAsync(
+        long leadId,
+        string voicemailId,
+        string callerNumber,
+        string callerName,
+        DateTime messageTimeUtc,
+        string transcript,
+        string recordingUrl)
+    {
+        const string entityType = "leads";
+
+        var callerLabel = string.IsNullOrWhiteSpace(callerName) ? callerNumber : callerName;
+        if (string.IsNullOrWhiteSpace(callerLabel))
+        {
+            // Тот же обязательный fallback, что и у звонков (CLAUDE.md,
+            // params.source не может быть пустым — 400 NotBlank/NotNullable).
+            // Скрытый номер (callerNumber тоже пуст) отсекается раньше, в
+            // вызывающем коде (action=no_number) — до создания заметки этот
+            // метод не доходит, но fallback оставлен как последний рубеж.
+            callerLabel = "RingCentral";
+        }
+
+        // call_in принимает только документированный набор полей params
+        // (uniq/duration/source/link/phone/call_responsible) — отдельного
+        // текстового поля нет (в отличие от common/sms_in/sms_out, у которых
+        // есть params.text, но они не принимают uniq/link, см. выбор типа
+        // заметки выше). source — короткая пометка с именем/номером и явным
+        // указанием, что это голосовое (иначе неотличимо от звонка в списке
+        // заметок); расшифровка и время сообщения идут в call_responsible —
+        // единственное свободное строковое поле схемы.
+        var source = $"{callerLabel} (голосовое сообщение)";
+        var transcriptText = string.IsNullOrWhiteSpace(transcript) ? "расшифровка недоступна" : transcript;
+        var callResponsible = $"[{messageTimeUtc:dd.MM.yyyy HH:mm} UTC] {transcriptText}";
+
+        var paramsObject = new JsonObject
+        {
+            ["uniq"] = voicemailId,
+            ["source"] = source,
+            ["phone"] = $"{callerNumber}",
+            ["call_responsible"] = callResponsible
+        };
+
+        if (!string.IsNullOrEmpty(recordingUrl))
+        {
+            paramsObject["link"] = recordingUrl;
+        }
+
+        var noteObject = new JsonObject
+        {
+            ["note_type"] = "call_in",
+            ["params"] = paramsObject,
+
+            // Тот же непроверенный официально, но эмпирически рабочий приём,
+            // что и у CreateCallNoteAsync (см. комментарий там) — created_at
+            // как время самого сообщения, а не момент обработки вебхука.
+            ["created_at"] = ((DateTimeOffset)DateTime.SpecifyKind(messageTimeUtc, DateTimeKind.Utc)).ToUnixTimeSeconds()
+        };
+
+        var rootJsonArray = new JsonArray { noteObject };
+
+        var content = new StringContent(rootJsonArray.ToJsonString(), Encoding.UTF8, "application/json");
+        var url = $"/api/v4/{entityType}/{leadId}/notes";
+        var resp = await _httpClient.PostAsync(url, content);
+
+        if (resp.IsSuccessStatusCode)
+        {
+            _logger.LogInformation("✅ Voicemail note added to amoCRM (Lead ID: {LeadId}). RingCentral message id: {VoicemailId}, recording: {HasLink}",
+                leadId, voicemailId, !string.IsNullOrEmpty(recordingUrl) ? "included" : "not available");
+            return true;
+        }
+
+        var voicemailErr = await resp.Content.ReadAsStringAsync();
+        _logger.LogError("Failed to add voicemail note: {StatusCode} {ErrorBody}. RingCentral message id: {VoicemailId}", resp.StatusCode, voicemailErr, voicemailId);
         return false;
     }
 
