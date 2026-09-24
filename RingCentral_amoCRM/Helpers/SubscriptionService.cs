@@ -88,11 +88,20 @@ public class SubscriptionService
         // developers.ringcentral.com/guide/notifications/event-filters/message.
         // Это НЕ полная замена instant-фильтра: входящие продолжают идти как раньше,
         // добавляется только вторая пара фильтров на исходящие.
+        //
+        // Третий фильтр — голосовая почта (message-store?type=VoiceMail). У RC
+        // нет instant-варианта для voicemail (только SMS его поддерживает, см.
+        // developers.ringcentral.com/guide/notifications/event-filters) — это
+        // та же не-instant сводка изменений (newCount/updatedCount), что и у
+        // исходящих SMS выше, а не готовое сообщение. Обрабатывается тем же
+        // HandleMessageStoreChangeAsync, веткой type=="VoiceMail" — см.
+        // RingCentralWebHookController.
         var eventFilters = usersIds
             .SelectMany(c => new[]
             {
                 $"/restapi/v1.0/account/~/extension/{c}/message-store/instant?type=SMS",
-                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=SMS&direction=Outbound"
+                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=SMS&direction=Outbound",
+                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=VoiceMail"
             })
             .ToArray();
 
