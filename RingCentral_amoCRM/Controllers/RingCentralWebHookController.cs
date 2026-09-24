@@ -18,6 +18,7 @@ public class RingCentralWebHookController : ControllerBase
     private readonly string _jwt;
     private readonly AmoCrmService _amoService;
     private readonly bool _smsOutboundEnabled;
+    private readonly bool _voicemailEnabled;
     private DateTime _expiresAt;
 
     public RingCentralWebHookController(
@@ -40,6 +41,15 @@ public class RingCentralWebHookController : ControllerBase
         // ничего не создаётся в amoCRM. Включается Sms__OutboundEnabled=true в
         // окружении после дня наблюдения за логами.
         _smsOutboundEnabled = configuration.GetValue("Sms:OutboundEnabled", false);
+
+        // По умолчанию включено (в отличие от Sms:OutboundEnabled) — задача
+        // явно просит Voicemail__Enabled=true по умолчанию. Выключатель
+        // существует для безопасного отката: Voicemail__Enabled=false в
+        // окружении полностью отключает фетч+создание заметок, оставляя
+        // только логирование счётчиков (см. HandleNewVoicemailsAsync) — та же
+        // модель безопасного отката, что и у Sms:OutboundEnabled, просто с
+        // другим значением по умолчанию.
+        _voicemailEnabled = configuration.GetValue("Voicemail:Enabled", true);
     }
 
     private async Task EnsureAuthorized()
@@ -180,24 +190,40 @@ public class RingCentralWebHookController : ControllerBase
         }
 
         var smsChange = changes.FirstOrDefault(c => c.Type == "SMS");
-        var otherChanges = changes.Where(c => c.Type != "SMS").ToList();
+        var voicemailChange = changes.FirstOrDefault(c => c.Type == "VoiceMail");
+        var otherChanges = changes.Where(c => c.Type != "SMS" && c.Type != "VoiceMail").ToList();
 
         var newCount = smsChange?.NewCount ?? 0;
         var updatedCount = smsChange?.UpdatedCount ?? 0;
         var otherCount = otherChanges.Sum(c => (c.NewCount ?? 0) + (c.UpdatedCount ?? 0));
 
+        var vmNewCount = voicemailChange?.NewCount ?? 0;
+        var vmUpdatedCount = voicemailChange?.UpdatedCount ?? 0;
+
         _logger.LogInformation(
-            "WEBHOOK event=message-store extId={ExtensionId} type=SMS new={NewCount} updated={UpdatedCount} otherTypes=[{OtherTypes}]",
-            notification.Body.ExtensionId, newCount, updatedCount, string.Join(",", otherChanges.Select(c => c.Type)));
+            "WEBHOOK event=message-store extId={ExtensionId} type=SMS new={NewCount} updated={UpdatedCount} vmNew={VmNewCount} vmUpdated={VmUpdatedCount} otherTypes=[{OtherTypes}]",
+            notification.Body.ExtensionId, newCount, updatedCount, vmNewCount, vmUpdatedCount, string.Join(",", otherChanges.Select(c => c.Type)));
 
         _amoService.RecordSmsWebhookSummary(newCount, updatedCount, otherCount);
+
+        // Голосовая почта обрабатывается независимо от ветки SMS ниже: у
+        // расширения может в одном уведомлении не быть новых SMS, но быть
+        // новое голосовое (или наоборот) — оба флага проверяются, ни один
+        // return здесь не должен пропускать другую ветку.
+        if (voicemailChange != null && vmNewCount > 0)
+        {
+            await HandleNewVoicemailsAsync(notification.Body.ExtensionId, notification.Body.LastUpdated, vmNewCount);
+        }
+        // vmUpdatedCount>0 без vmNewCount (прослушано/удалено существующее) —
+        // осознанно не обрабатывается, только вошло в лог выше (см. п.2 задачи:
+        // фильтр без direction шлёт и статусные изменения, реагируем только на
+        // действительно новые голосовые).
 
         if (smsChange == null || newCount <= 0)
         {
             // Ничего нового: только read/delete/status-change на уже существующих
-            // SMS (updatedCount) и/или изменения других типов (vm/fax/pager) —
-            // не обрабатываем ни при каких условиях (см. задачу: голосовую почту
-            // и т.п. на этом этапе только логируем).
+            // SMS (updatedCount) и/или изменения прочих типов (fax/pager) —
+            // не обрабатываем ни при каких условиях.
             return Ok();
         }
 
@@ -257,6 +283,200 @@ public class RingCentralWebHookController : ControllerBase
         }
 
         return Ok();
+    }
+
+    // Реагирует на "есть новые голосовые" из не-instant сводки message-store
+    // (см. HandleMessageStoreChangeAsync) — сам вебхук не несёт данные
+    // сообщения (номер/запись/расшифровку), только счётчик, поэтому дальше
+    // дозапрашиваем через MessageStore().List(messageType=VoiceMail), тот же
+    // паттерн, что и у исходящих SMS (fetch-on-notify, а не постоянный
+    // поллер). Ошибки логируются и проглатываются — тот же принцип "всегда
+    // 200 для RC", что и у остального HandleMessageStoreChangeAsync.
+    private async Task HandleNewVoicemailsAsync(string extensionId, DateTime? notificationLastUpdatedUtc, int newCount)
+    {
+        if (!_voicemailEnabled)
+        {
+            _logger.LogInformation(
+                "Voicemail:Enabled=false, not fetching {NewCount} new voicemail(s) for extension {ExtensionId} (log-only)",
+                newCount, extensionId);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(extensionId))
+        {
+            _logger.LogWarning("WEBHOOK message-store notification missing extensionId, cannot fetch voicemails");
+            return;
+        }
+
+        // Курсор продвигается до фетча — тот же аргумент "пропустить лучше,
+        // чем задублировать", что и у AdvanceOutboundSmsCheckpoint.
+        var sinceUtc = _amoService.AdvanceVoicemailCheckpoint(extensionId, notificationLastUpdatedUtc);
+
+        GetMessageList fetched;
+        try
+        {
+            fetched = await _amoService.FetchVoicemailsAsync(extensionId, sinceUtc);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to fetch voicemails for extension {ExtensionId} since {SinceUtc}", extensionId, sinceUtc);
+            return;
+        }
+
+        var records = fetched?.records;
+        if (records == null || records.Length == 0)
+        {
+            _logger.LogInformation("MessageStore.List(VoiceMail) for extension {ExtensionId} since {SinceUtc} returned no records", extensionId, sinceUtc);
+            return;
+        }
+
+        foreach (var msg in records)
+        {
+            if (msg.type != "VoiceMail")
+            {
+                continue; // на случай, если API вернул что-то за пределами фильтра
+            }
+
+            await ProcessVoicemailAsync(extensionId, msg);
+        }
+    }
+
+    // Обработка одного голосового сообщения: дедупликация, поиск сделки по
+    // номеру звонившего, загрузка записи, создание заметки. Формат
+    // наблюдаемости фиксирован задачей: "VM id=<id> number=<номер>
+    // lead=<id|none> action=<attached|dup|no_lead|no_number|error>
+    // transcript=<yes|no>".
+    private async Task ProcessVoicemailAsync(string extensionId, GetMessageInfoResponse msg)
+    {
+        var voicemailId = msg.id?.ToString();
+        var callerNumber = msg.from?.phoneNumber;
+        var callerName = msg.from?.name;
+        var hasTranscript = msg.vmTranscriptionStatus == "Completed";
+
+        // Скрытый номер (внешний абонент без Caller ID) — RC не гарантирует
+        // from.phoneNumber (см. задачу). Без номера искать сделку нечем —
+        // пропускаем, не падая, как и просила задача.
+        if (string.IsNullOrWhiteSpace(callerNumber))
+        {
+            _logger.LogInformation("VM id={Id} number=none lead=none action=no_number transcript={Transcript}",
+                voicemailId, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        if (_amoService.IsVoicemailProcessed(voicemailId))
+        {
+            _logger.LogInformation("VM id={Id} number={Number} lead=none action=dup transcript={Transcript}",
+                voicemailId, callerNumber, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        if (_amoService.IsExpired())
+        {
+            await _amoService.InitializeAsync();
+        }
+
+        IEnumerable<long> candidateLeads;
+        try
+        {
+            candidateLeads = await _amoService.FindLeadByPhoneNumberAsync(callerNumber);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "VM id={Id} number={Number} lead=none action=error transcript={Transcript} reason=lead_search_failed",
+                voicemailId, callerNumber, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        if (candidateLeads == null)
+        {
+            _logger.LogInformation("VM id={Id} number={Number} lead=none action=no_lead transcript={Transcript}",
+                voicemailId, callerNumber, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        var targetLeadId = await _amoService.ResolveTargetLeadAsync(candidateLeads);
+        if (targetLeadId == null)
+        {
+            _logger.LogInformation("VM id={Id} number={Number} lead=none action=no_lead transcript={Transcript}",
+                voicemailId, callerNumber, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        bool noteExists;
+        try
+        {
+            // failClosed=false: тот же выбор, что и у основного поллинга звонков
+            // (POLL, не LATE/STARTUP) — узкое окно фетча "по уведомлению",
+            // следующего отдельного прохода за этим же сообщением нет, так что
+            // fail-open (при сбое считаем, что заметки нет) безопаснее, чем
+            // потерять голосовое совсем.
+            noteExists = await _amoService.NoteExistsAsync(targetLeadId.Value, "call_in", voicemailId);
+        }
+        catch (AmoCrmService.NoteExistenceUnknownException ex)
+        {
+            _logger.LogWarning(ex, "VM id={Id} number={Number} lead={LeadId} action=error transcript={Transcript} reason=note_check_failed",
+                voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        if (noteExists)
+        {
+            _amoService.MarkVoicemailProcessed(voicemailId);
+            _logger.LogInformation("VM id={Id} number={Number} lead={LeadId} action=dup transcript={Transcript}",
+                voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        string recordingUrl = null;
+        var recordingAttachment = msg.attachments?.FirstOrDefault(a => a.type == "AudioRecording");
+        if (recordingAttachment?.id != null)
+        {
+            var uploadResult = await _amoService.UploadVoicemailRecordingAsync(extensionId, voicemailId, recordingAttachment.id.ToString());
+            if (uploadResult.Outcome == RecordingUploadOutcome.Uploaded)
+            {
+                recordingUrl = uploadResult.Url;
+            }
+            // NotAvailable/Failed — создаём заметку без ссылки на запись, как
+            // и у звонков в основном (не failClosed) пути: узкое окно, следующей
+            // попытки специально под это сообщение нет.
+        }
+
+        string transcript = null;
+        if (hasTranscript)
+        {
+            var transcriptionAttachment = msg.attachments?.FirstOrDefault(a => a.type == "AudioTranscription");
+            if (transcriptionAttachment?.id != null)
+            {
+                transcript = await _amoService.FetchVoicemailTranscriptAsync(extensionId, voicemailId, transcriptionAttachment.id.ToString());
+            }
+        }
+
+        // GetMessageInfoResponse.creationTime — string (ISO 8601 с Z, как и у
+        // остальных времён RC), не DateTime — см. CLAUDE.md про прошлый баг
+        // класса "startTime распарсен не как UTC": парсим явно через
+        // DateTimeStyles.AdjustToUniversal|AssumeUniversal, чтобы Z корректно
+        // дал Kind=Utc независимо от TimeZoneInfo хоста.
+        var messageTimeUtc = DateTime.TryParse(
+            msg.creationTime,
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+            out var parsedCreationTime)
+            ? parsedCreationTime
+            : DateTime.UtcNow;
+
+        bool noteCreated = await _amoService.CreateVoicemailNoteAsync(
+            targetLeadId.Value, voicemailId, callerNumber, callerName, messageTimeUtc, transcript, recordingUrl);
+
+        if (!noteCreated)
+        {
+            _logger.LogWarning("VM id={Id} number={Number} lead={LeadId} action=error transcript={Transcript} reason=note_create_failed",
+                voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
+            return;
+        }
+
+        _amoService.MarkVoicemailProcessed(voicemailId);
+        _logger.LogInformation("VM id={Id} number={Number} lead={LeadId} action=attached transcript={Transcript}",
+            voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
     }
 
     // Общая обработка одного SMS-сообщения (входящего или исходящего) —

@@ -1358,6 +1358,34 @@ public class AmoCrmService
         }
     }
 
+    // Скачивает текст расшифровки голосового (вложение AudioTranscription —
+    // по данным RC, plain text). Возвращает null при любой проблеме
+    // (скачивание не удалось, пустой контент, невалидная кодировка) —
+    // вызывающий код трактует это как "расшифровки нет", ровно то же, что и
+    // vmTranscriptionStatus != Completed (см. задачу: код обязан работать
+    // и без текста).
+    public async Task<string> FetchVoicemailTranscriptAsync(string extensionId, string messageId, string attachmentId)
+    {
+        try
+        {
+            var bytes = await RunWithRcRetryAsync(
+                () => _rc.Restapi().Account().Extension(extensionId).MessageStore(messageId).Content(attachmentId).Get(),
+                $"VoicemailTranscript {messageId}/{attachmentId}");
+
+            if (bytes == null || bytes.Length == 0)
+            {
+                return null;
+            }
+
+            return Encoding.UTF8.GetString(bytes).Trim();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch voicemail transcript for message {MessageId}, attachment {AttachmentId}", messageId, attachmentId);
+            return null;
+        }
+    }
+
     // Возвращает true только при 2xx-ответе amoCRM на создание заметки.
     // Вызывающий код (ProcessSingleCallAsync) обязан проверить результат —
     // не-2xx не должен трактоваться как успех.
