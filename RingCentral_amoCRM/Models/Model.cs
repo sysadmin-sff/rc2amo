@@ -1,8 +1,38 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace RingCentral_amoCRM.Models;
+
+// Принимает значение поля и как JSON-строку, и как JSON-число (RC непоследователен
+// в типах id-подобных полей между разными payload; для основного instant-события
+// (RingCentralNotification/MessageBody) это ни разу не было проблемой на проде, но
+// новый non-instant message-store payload (MessageStoreChangeNotification и ниже)
+// нигде не проверялся на реальных данных до вылезшего в проде
+// "Cannot get the value of a token type 'Number' as a string" — используем этот
+// конвертер на всех строковых полях новой модели, чтобы неверно угаданный тип
+// одного поля не ронял разбор всего уведомления.
+public class FlexibleStringConverter : JsonConverter<string>
+{
+    public override string Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.String => reader.GetString(),
+            JsonTokenType.Number => reader.TryGetInt64(out var l) ? l.ToString() : reader.GetDouble().ToString(),
+            JsonTokenType.True => "true",
+            JsonTokenType.False => "false",
+            JsonTokenType.Null => null,
+            _ => null
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value);
+    }
+}
 // ----------------------------------------------------------------------
 // 1. Вспомогательные классы для данных "from" и "to"
 // ----------------------------------------------------------------------
@@ -169,6 +199,7 @@ public class RingCentralNotification
 public class MessageStoreChange
 {
     [JsonPropertyName("type")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Type { get; set; }
 
     [JsonPropertyName("newCount")]
@@ -181,9 +212,11 @@ public class MessageStoreChange
 public class MessageStoreChangeBody
 {
     [JsonPropertyName("extensionId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string ExtensionId { get; set; }
 
     [JsonPropertyName("accountId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string AccountId { get; set; }
 
     [JsonPropertyName("lastUpdated")]
@@ -196,18 +229,22 @@ public class MessageStoreChangeBody
 public class MessageStoreChangeNotification
 {
     [JsonPropertyName("uuid")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Uuid { get; set; }
 
     [JsonPropertyName("event")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Event { get; set; }
 
     [JsonPropertyName("timestamp")]
     public DateTime Timestamp { get; set; }
 
     [JsonPropertyName("subscriptionId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string SubscriptionId { get; set; }
 
     [JsonPropertyName("ownerId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string OwnerId { get; set; }
 
     [JsonPropertyName("body")]
