@@ -1148,6 +1148,10 @@ public class AmoCrmService
     // голосовая почта у RC всегда Inbound (пропущенный/переведённый на
     // автоответчик звонок), фильтр по direction не нужен и не документирован
     // как поддерживаемый для VoiceMail.
+    // "VoiceMail" (заглавная M) — проверено прямыми запросами к RC (см.
+    // CLAUDE.md). НЕ путать с eventFilter подписки (SubscriptionService),
+    // который для того же понятия требует "Voicemail" (строчная m) — разный
+    // регистр в разных частях API RC, не опечатка ни там, ни тут.
     public Task<GetMessageList> FetchVoicemailsAsync(string extensionId, DateTime sinceUtc) =>
         RunWithLightRetryAsync(
             () => _rc.Restapi().Account().Extension(extensionId).MessageStore().List(new ListMessagesParameters

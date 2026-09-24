@@ -89,19 +89,28 @@ public class SubscriptionService
         // Это НЕ полная замена instant-фильтра: входящие продолжают идти как раньше,
         // добавляется только вторая пара фильтров на исходящие.
         //
-        // Третий фильтр — голосовая почта (message-store?type=VoiceMail). У RC
+        // Третий фильтр — голосовая почта (message-store?type=Voicemail). У RC
         // нет instant-варианта для voicemail (только SMS его поддерживает, см.
         // developers.ringcentral.com/guide/notifications/event-filters) — это
         // та же не-instant сводка изменений (newCount/updatedCount), что и у
         // исходящих SMS выше, а не готовое сообщение. Обрабатывается тем же
-        // HandleMessageStoreChangeAsync, веткой type=="VoiceMail" — см.
-        // RingCentralWebHookController.
+        // HandleMessageStoreChangeAsync, веткой type=="VoiceMail" (регистронезависимо,
+        // см. комментарий там) — см. RingCentralWebHookController.
+        //
+        // ВАЖНО (проверено прямыми запросами к RC, см. CLAUDE.md): регистр
+        // здесь ДРУГОЙ, чем при чтении message-store. eventFilter подписки
+        // принимает только "Voicemail" (маленькая m) — "VoiceMail" и
+        // "type=VoiceMail" оба дают 400 CMN-101 "Parameter [eventFilters]
+        // value is invalid". При этом ListMessagesParameters.messageType при
+        // выборке сообщений (FetchVoicemailsAsync) требует "VoiceMail" —
+        // это два независимых поля разных API с разным регистром одного и
+        // того же понятия, а не опечатка.
         var eventFilters = usersIds
             .SelectMany(c => new[]
             {
                 $"/restapi/v1.0/account/~/extension/{c}/message-store/instant?type=SMS",
                 $"/restapi/v1.0/account/~/extension/{c}/message-store?type=SMS&direction=Outbound",
-                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=VoiceMail"
+                $"/restapi/v1.0/account/~/extension/{c}/message-store?type=Voicemail"
             })
             .ToArray();
 

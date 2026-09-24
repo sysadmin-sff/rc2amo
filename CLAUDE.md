@@ -28,12 +28,22 @@
   записи в адресной книге) — всегда нужен fallback (используется
   "RingCentral").
 - sms_in/sms_out: params.uniq НЕ принимается (400 FieldNotExpected).
+- Голосовая почта (RingCentral message-store): регистр слова "voicemail"
+  РАЗНЫЙ в разных частях API RC — не опечатка, проверено прямыми запросами:
+  - eventFilter подписки (создание/обновление подписки на вебхуки):
+    только `type=Voicemail` (строчная m). `type=VoiceMail` и
+    `messageType=VoiceMail` дают 400 CMN-101 "Parameter [eventFilters]
+    value is invalid".
+  - Чтение message-store (ListMessagesParameters при выборке сообщений):
+    `messageType=VoiceMail` (заглавная M).
+  - Значение changes[].type в самом теле вебхука отдельно не проверялось —
+    сравнение с ним в коде сделано регистронезависимым на всякий случай.
 
 Call log:
 - withRecording=true в call log — намеренный фильтр, отсекает пропущенные
   звонки (голосовая почта из автоответчика туда не попадает). Не убирать
   без учёта: голосовая почта обрабатывается отдельно (см. voicemail-фичу,
-  message-store type=VoiceMail), и если withRecording когда-нибудь снимут,
-  один пропущенный звонок с голосовым сообщением даст ДВЕ заметки — одну
-  от call log (call_in), одну от voicemail-пути (тоже call_in, но с
+  message-store, регистр см. выше), и если withRecording когда-нибудь
+  снимут, один пропущенный звонок с голосовым сообщением даст ДВЕ заметки —
+  одну от call log (call_in), одну от voicemail-пути (тоже call_in, но с
   отдельным uniq = id голосового сообщения RC, не id звонка).

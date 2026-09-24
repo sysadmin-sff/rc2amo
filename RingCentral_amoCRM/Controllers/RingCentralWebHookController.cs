@@ -190,8 +190,15 @@ public class RingCentralWebHookController : ControllerBase
         }
 
         var smsChange = changes.FirstOrDefault(c => c.Type == "SMS");
-        var voicemailChange = changes.FirstOrDefault(c => c.Type == "VoiceMail");
-        var otherChanges = changes.Where(c => c.Type != "SMS" && c.Type != "VoiceMail").ToList();
+        // Регистронезависимо: eventFilter подписки требует "Voicemail" (см.
+        // SubscriptionService), но неизвестно, эхом каким регистром сам RC
+        // проставит changes[].type в теле вебхука — проверено на проде только
+        // то, что eventFilter с "VoiceMail" (заглавная M) отклоняется целиком
+        // (400 CMN-101), само значение type в уже принятом вебхуке отдельно
+        // не проверялось. StringComparer.OrdinalIgnoreCase дешевле, чем
+        // рисковать пропустить голосовые из-за расхождения в одну букву.
+        var voicemailChange = changes.FirstOrDefault(c => string.Equals(c.Type, "VoiceMail", StringComparison.OrdinalIgnoreCase));
+        var otherChanges = changes.Where(c => c.Type != "SMS" && !string.Equals(c.Type, "VoiceMail", StringComparison.OrdinalIgnoreCase)).ToList();
 
         var newCount = smsChange?.NewCount ?? 0;
         var updatedCount = smsChange?.UpdatedCount ?? 0;
@@ -333,7 +340,12 @@ public class RingCentralWebHookController : ControllerBase
 
         foreach (var msg in records)
         {
-            if (msg.type != "VoiceMail")
+            // Регистронезависимо — та же осторожность, что и при разборе
+            // changes[].type выше (см. HandleMessageStoreChangeAsync):
+            // подтверждено на проде только то, что чтение через
+            // ListMessagesParameters.messageType требует "VoiceMail"
+            // (заглавная M), само поле type в ответе отдельно не сверялось.
+            if (!string.Equals(msg.type, "VoiceMail", StringComparison.OrdinalIgnoreCase))
             {
                 continue; // на случай, если API вернул что-то за пределами фильтра
             }
