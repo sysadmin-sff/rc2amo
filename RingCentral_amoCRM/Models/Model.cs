@@ -33,6 +33,33 @@ public class FlexibleStringConverter : JsonConverter<string>
         writer.WriteStringValue(value);
     }
 }
+
+// Обратный случай той же непоследовательности RC: числовое по смыслу поле
+// (newCount/updatedCount) приходит строкой. System.Text.Json по умолчанию
+// не приводит "3" к int? так же, как не приводит 3 к string — тот же класс
+// падения, что чинит FlexibleStringConverter, только в другую сторону.
+// Не подтверждено на реальном payload (в отличие от FlexibleStringConverter,
+// у которого падение уже было в проде), добавлено превентивно по итогам
+// ревью всех числовых/id-полей моделей вебхука.
+public class FlexibleIntConverter : JsonConverter<int?>
+{
+    public override int? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.Number => reader.TryGetInt32(out var i) ? i : (int?)null,
+            JsonTokenType.String => int.TryParse(reader.GetString(), out var parsed) ? parsed : (int?)null,
+            JsonTokenType.Null => null,
+            _ => null
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, int? value, JsonSerializerOptions options)
+    {
+        if (value.HasValue) writer.WriteNumberValue(value.Value);
+        else writer.WriteNullValue();
+    }
+}
 // ----------------------------------------------------------------------
 // 1. Вспомогательные классы для данных "from" и "to"
 // ----------------------------------------------------------------------
@@ -69,7 +96,14 @@ public class PartyInfo
 
 public class Attachment
 {
+    // Прод: 500 "Cannot get the value of a token type 'Number' as a string"
+    // на $.body.attachments[1].size — RC шлёт size числом, не строкой, хотя
+    // это старая (instant SMS/MMS) модель, месяцами работавшая без проблем
+    // до вложений с числовым size. id — тот же класс риска (см. комментарий
+    // у FlexibleStringConverter про непоследовательность RC в id-подобных
+    // полях) — конвертер на оба на всякий случай, а не только на упавшее.
     [JsonPropertyName("id")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Id { get; set; }
 
     [JsonPropertyName("type")]
@@ -77,17 +111,19 @@ public class Attachment
 
     [JsonPropertyName("contentType")]
     public string ContentType { get; set; }
-    
+
     [JsonPropertyName("uri")]
     public string Uri { get; set; }
-    
+
     [JsonPropertyName("size")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Size { get; set; }
 }
 
 public class Conversation
 {
     [JsonPropertyName("id")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Id { get; set; }
 }
 
@@ -110,7 +146,10 @@ public class OwnerInfo
 
 public class MessageBody
 {
+    // Тот же класс риска, что и у Attachment.Id/Size выше — RC id-подобные
+    // поля присылает непоследовательно (строкой или числом) в разных payload.
     [JsonPropertyName("id")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Id { get; set; }
 
     [JsonPropertyName("to")]
@@ -167,19 +206,26 @@ public class MessageBody
 
 public class RingCentralNotification
 {
+    // Та же непоследовательность RC в id-подобных полях, что и у
+    // MessageStoreChangeNotification ниже (там уже покрыто конвертером) —
+    // этот, старый, instant-SMS путь не был защищён вообще, хотя риск тот же.
     [JsonPropertyName("uuid")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Uuid { get; set; }
 
     [JsonPropertyName("event")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string Event { get; set; }
 
     [JsonPropertyName("timestamp")]
     public DateTime Timestamp { get; set; }
 
     [JsonPropertyName("subscriptionId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string SubscriptionId { get; set; }
 
     [JsonPropertyName("ownerId")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string OwnerId { get; set; }
 
     [JsonPropertyName("body")]
@@ -203,9 +249,11 @@ public class MessageStoreChange
     public string Type { get; set; }
 
     [JsonPropertyName("newCount")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
     public int? NewCount { get; set; }
 
     [JsonPropertyName("updatedCount")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
     public int? UpdatedCount { get; set; }
 }
 
