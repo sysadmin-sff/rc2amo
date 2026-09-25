@@ -1540,7 +1540,8 @@ public class AmoCrmService
         string callerName,
         DateTime messageTimeUtc,
         string transcript,
-        string recordingUrl)
+        string recordingUrl,
+        long durationSeconds)
     {
         const string entityType = "leads";
 
@@ -1567,9 +1568,16 @@ public class AmoCrmService
         var transcriptText = string.IsNullOrWhiteSpace(transcript) ? "расшифровка недоступна" : transcript;
         var callResponsible = $"[{messageTimeUtc:dd.MM.yyyy HH:mm} UTC] {transcriptText}";
 
+        // Прод: 400 FieldMissing на params.duration — не задокументировано
+        // заранее amoCRM (как и params.source, см. CLAUDE.md), обязательность
+        // выяснена только по факту отказа. У голосовых нет отдельного понятия
+        // длительности разговора — используем vmDuration вложения
+        // AudioRecording (вызывающий код передаёт 0, если вложения/поля нет,
+        // лишь бы поле в params присутствовало).
         var paramsObject = new JsonObject
         {
             ["uniq"] = voicemailId,
+            ["duration"] = durationSeconds,
             ["source"] = source,
             ["phone"] = $"{callerNumber}",
             ["call_responsible"] = callResponsible

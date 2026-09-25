@@ -19,6 +19,14 @@ public class RingCentralWebHookController : ControllerBase
     private readonly AmoCrmService _amoService;
     private readonly bool _smsOutboundEnabled;
     private readonly bool _voicemailEnabled;
+
+    // Задержка перед фетчем голосовых после уведомления — даёт транскрипции
+    // RC время на завершение (см. HandleNewVoicemailsAsync). Фиксированное
+    // значение, не конфиг: это узкая техническая подстройка под наблюдаемую
+    // на проде задержку самой RC, а не поведение, которое нужно включать/
+    // выключать по обстоятельствам (в отличие от Voicemail:Enabled).
+    private static readonly TimeSpan VoicemailTranscriptionDelay = TimeSpan.FromSeconds(15);
+
     private DateTime _expiresAt;
 
     public RingCentralWebHookController(
@@ -336,8 +344,21 @@ public class RingCentralWebHookController : ControllerBase
         }
 
         // Курсор продвигается до фетча — тот же аргумент "пропустить лучше,
-        // чем задублировать", что и у AdvanceOutboundSmsCheckpoint.
+        // чем задублировать", что и у AdvanceOutboundSmsCheckpoint. Продвигаем
+        // ДО задержки ниже: граница окна выборки считается от момента
+        // уведомления, а не от момента, когда мы реально пошли за данными.
         var sinceUtc = _amoService.AdvanceVoicemailCheckpoint(extensionId, notificationLastUpdatedUtc);
+
+        // Прод: транскрипция (vmTranscriptionStatus) часто ещё не готова в
+        // момент самого уведомления — вебхук приходит через несколько секунд
+        // после создания сообщения, а расшифровка может занять больше времени,
+        // чем этот зазор. Без задержки CreateVoicemailNoteAsync создаётся с
+        // "расшифровка недоступна" даже для сообщений, у которых
+        // vmTranscriptionStatus становится Completed буквально через
+        // несколько секунд. Фиксированная пауза перед фетчем — самый простой
+        // способ дать транскрипции обычный шанс успеть; повторной проверки/
+        // догона после создания заметки нет (заметка одна и без обновлений).
+        await Task.Delay(VoicemailTranscriptionDelay);
 
         GetMessageList fetched;
         try
@@ -483,6 +504,16 @@ public class RingCentralWebHookController : ControllerBase
             }
         }
 
+        // Лог ниже (action=attached/error после попытки фетча) должен отражать
+        // РЕАЛЬНЫЙ результат — transcript != null — а не hasTranscript (флаг
+        // RC на момент получения сообщения). Раньше здесь везде логировался
+        // hasTranscript: если fetch расшифровки молча не удался (см.
+        // FetchVoicemailTranscriptAsync — возвращает null и на сбой скачивания,
+        // и на пустой контент), лог всё равно писал transcript=yes, хотя
+        // в заметку ушла пометка "расшифровка недоступна" — вводило в
+        // заблуждение о причине её отсутствия в заметке.
+        var transcriptFetched = transcript != null;
+
         // GetMessageInfoResponse.creationTime — string (ISO 8601 с Z, как и у
         // остальных времён RC), не DateTime — см. CLAUDE.md про прошлый баг
         // класса "startTime распарсен не как UTC": парсим явно через
@@ -496,19 +527,28 @@ public class RingCentralWebHookController : ControllerBase
             ? parsedCreationTime
             : DateTime.UtcNow;
 
+        // duration — обязательное поле params для call_in (проверено на
+        // проде: 400 FieldMissing без него, не задокументировано заранее —
+        // см. CLAUDE.md). У голосовых источник — vmDuration на вложении
+        // AudioRecording (проверено по RingCentral.Net.dll: GetMessageInfoResponse
+        // такого поля на верхнем уровне не имеет вообще, только
+        // MessageAttachmentInfo.vmDuration). Если вложения AudioRecording нет
+        // или у него нет vmDuration — 0, лишь бы поле присутствовало.
+        var durationSeconds = recordingAttachment?.vmDuration ?? 0;
+
         bool noteCreated = await _amoService.CreateVoicemailNoteAsync(
-            targetLeadId.Value, voicemailId, callerNumber, callerName, messageTimeUtc, transcript, recordingUrl);
+            targetLeadId.Value, voicemailId, callerNumber, callerName, messageTimeUtc, transcript, recordingUrl, durationSeconds);
 
         if (!noteCreated)
         {
             _logger.LogWarning("VM id={Id} number={Number} lead={LeadId} action=error transcript={Transcript} reason=note_create_failed",
-                voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
+                voicemailId, callerNumber, targetLeadId, transcriptFetched ? "yes" : "no");
             return;
         }
 
         _amoService.MarkVoicemailProcessed(voicemailId);
         _logger.LogInformation("VM id={Id} number={Number} lead={LeadId} action=attached transcript={Transcript}",
-            voicemailId, callerNumber, targetLeadId, hasTranscript ? "yes" : "no");
+            voicemailId, callerNumber, targetLeadId, transcriptFetched ? "yes" : "no");
     }
 
     // Общая обработка одного SMS-сообщения (входящего или исходящего) —
