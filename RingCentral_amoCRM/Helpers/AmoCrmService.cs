@@ -139,6 +139,13 @@ public class AmoCrmService
     // немного исходящих SMS в узком окне рестарта безопаснее, чем задублировать
     // заметки в amoCRM. Курсор — тоже только в памяти, тот же класс риска, что
     // и _processedSmsIds (см. риск в описании задачи).
+    //
+    // НЕ путать с _voicemailCheckpoints ниже, у которого отступ назад ЕСТЬ:
+    // разница не случайна, а в разной надёжности дедупликации между sms_out
+    // (amoCRM отклоняет params.uniq — только in-memory) и call_in у голосовых
+    // (params.uniq принимается — NoteExistsAsync через amoCRM переживает
+    // рестарт). Если sms_out когда-нибудь получит поддержку uniq в amoCRM,
+    // этот выбор стоит пересмотреть вместе с ним.
     private readonly ConcurrentDictionary<string, DateTime> _outboundSmsCheckpoints = new();
 
     // Возвращает нижнюю границу выборки для расширения и в том же вызове
@@ -182,12 +189,29 @@ public class AmoCrmService
     }
 
     // Курсор "с какого момента ещё не забирали голосовые сообщения" на
-    // расширение — тот же класс риска/то же поведение, что и
-    // _outboundSmsCheckpoints выше (см. комментарий там): только в памяти,
-    // без отступа назад при первом уведомлении по расширению, сбрасывается
-    // при рестарте. Отдельный словарь, а не переиспользование SMS-курсора:
-    // разные типы сообщений, разные окна выборки, самостоятельный сброс.
+    // расширение — только в памяти, сбрасывается при рестарте (тот же класс
+    // риска, что и _outboundSmsCheckpoints ниже). Отдельный словарь, а не
+    // переиспользование SMS-курсора: разные типы сообщений, разные окна
+    // выборки, самостоятельный сброс.
+    //
+    // В ОТЛИЧИЕ от SMS-курсора: первое уведомление по расширению стартует
+    // не от UtcNow, а от UtcNow − VoicemailFirstCheckpointLookback (см. ниже).
+    // Прод-находка: голосовое создаётся за несколько секунд ДО того, как
+    // приходит уведомление о нём (webhook event=message-store, vmNew=1) —
+    // курсор "с текущей секунды" систематически исключал именно то
+    // сообщение, о котором и пришло уведомление
+    // (MessageStore.List(VoiceMail) ... returned no records). Задел назад
+    // безопасен для голосовых и НЕ безопасен для SMS: у голосовых note_type
+    // "call_in" принимает params.uniq, так что NoteExistsAsync — надёжный
+    // бэкстоп от дублей независимо от ширины окна выборки; у исходящих SMS
+    // (sms_out) amoCRM params.uniq не принимает (см. NoteExistsAsync), дедуп
+    // только в памяти (_processedSmsIds) и сбрасывается при рестарте — задел
+    // назад там означал бы реальный риск задублировать SMS-заметки после
+    // каждого рестарта. Поэтому у AdvanceOutboundSmsCheckpoint ниже задела
+    // нет и не должно быть.
     private readonly ConcurrentDictionary<string, DateTime> _voicemailCheckpoints = new();
+
+    private static readonly TimeSpan VoicemailFirstCheckpointLookback = TimeSpan.FromMinutes(5);
 
     public DateTime AdvanceVoicemailCheckpoint(string extensionId, DateTime? notificationLastUpdatedUtc)
     {
@@ -202,7 +226,7 @@ public class AmoCrmService
             extensionId,
             addValueFactory: _ =>
             {
-                previous = DateTime.UtcNow;
+                previous = DateTime.UtcNow - VoicemailFirstCheckpointLookback;
                 return previous;
             },
             updateValueFactory: (_, existing) =>
