@@ -116,15 +116,29 @@ public class RingCentralWebHookController : ControllerBase
                 }
             }
 
-            var notification = System.Text.Json.JsonSerializer.Deserialize<RingCentralNotification>(notificationJson);
+            // Инстант-путь (входящие SMS/MMS) — старый, месяцами работавший в
+            // проде код, но БЕЗ какой-либо защиты от исключения: раньше здесь
+            // не было try/catch вообще (в отличие от не-instant пути ниже,
+            // который его получил в 0ea4cb8). Падение здесь (например,
+            // Cannot get the value of a token type 'Number' as a string на
+            // attachments[].size у MMS-вложения — см. Model.cs) уходило прямо
+            // в Kestrel: RC получал 500, считал доставку неуспешной и повторял
+            // её — то же самое падение на том же теле повторялось бесконечно,
+            // а WEBHOOK RAW при этом никогда не логировался, потому что
+            // логирование было только внутри HandleMessageStoreChangeAsync.
+            // Оборачиваем весь инстант-путь (разбор + обработка), а не только
+            // Deserialize — исключение из ProcessSmsMessageAsync (например,
+            // сбой похода в amoCRM) должно точно так же не ронять запрос в 500.
+            try
+            {
+                var notification = System.Text.Json.JsonSerializer.Deserialize<RingCentralNotification>(notificationJson);
 
-            if (notification?.Body == null)
-            {
-                _logger.LogWarning("WebHook received (no validation token), but body was empty or invalid JSON. Returning 200 OK.");
-                return Ok();
-            }
-            if (notification?.Body != null)
-            {
+                if (notification?.Body == null)
+                {
+                    _logger.LogWarning("WebHook received (no validation token), but body was empty or invalid JSON. Returning 200 OK.");
+                    return Ok();
+                }
+
                 if ((notification.Body.Direction == "Inbound" || notification.Body.Direction == "Outbound") &&
                     notification.Body.Type == "SMS")
                 {
@@ -142,6 +156,11 @@ public class RingCentralWebHookController : ControllerBase
                         notification.Body.Subject);
                     return Created();
                 }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Instant SMS webhook path threw unhandled exception. WEBHOOK RAW {RawPayload}", notificationJson);
+                return Ok();
             }
         }
 
