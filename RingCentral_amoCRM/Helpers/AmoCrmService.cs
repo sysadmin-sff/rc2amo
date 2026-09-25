@@ -1522,6 +1522,19 @@ public class AmoCrmService
         return false;
     }
 
+    // Часовой пояс для отображения времени голосового в call_responsible
+    // (по явному запросу — только для голосовых, не для звонков, см.
+    // CreateCallNoteAsync). Ленивая инициализация через Lazy<T>, а не
+    // статический readonly-конструктор напрямую: TimeZoneNotFoundException/
+    // InvalidTimeZoneException (например, если у хоста нет данных ICU) не
+    // должна ронять загрузку всего класса AmoCrmService при старте процесса —
+    // упасть должен только вызов, реально нуждающийся в этом поясе, и только
+    // при первом обращении.
+    private static readonly Lazy<TimeZoneInfo> EasternTimeZoneLazy = new(() =>
+        TimeZoneInfo.FindSystemTimeZoneById("America/New_York"));
+
+    private static TimeZoneInfo EasternTimeZone => EasternTimeZoneLazy.Value;
+
     // Создаёт заметку по голосовому сообщению. note_type="call_in" (решение
     // принято явно, не common): только call_in/call_out принимают
     // params.uniq и params.link в amoCRM v4 (common — только text), так что
@@ -1566,7 +1579,32 @@ public class AmoCrmService
         // единственное свободное строковое поле схемы.
         var source = $"{callerLabel} (голосовое сообщение)";
         var transcriptText = string.IsNullOrWhiteSpace(transcript) ? "расшифровка недоступна" : transcript;
-        var callResponsible = $"[{messageTimeUtc:dd.MM.yyyy HH:mm} UTC] {transcriptText}";
+
+        // Время для отображения — локальная зона сервера (America/New_York),
+        // а не UTC: только для этой (voicemail) заметки, по явному запросу —
+        // CreateCallNoteAsync для обычных звонков продолжает печатать UTC как
+        // раньше (звонки этот запрос не затрагивает).
+        // "America/New_York" — IANA id, начиная с .NET 6 TimeZoneInfo
+        // резолвит их на всех платформах (в т.ч. Windows), Windows-специфичный
+        // id вроде "Eastern Standard Time" не нужен. Fallback на UTC при
+        // сбое поиска пояса (например, нет данных ICU на хосте) — заметка
+        // всё равно должна создаться, просто с UTC-временем вместо
+        // локального, а не провалиться целиком из-за косметики.
+        DateTime displayTime;
+        try
+        {
+            displayTime = TimeZoneInfo.ConvertTimeFromUtc(messageTimeUtc, EasternTimeZone);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to convert voicemail time to America/New_York, falling back to UTC");
+            displayTime = messageTimeUtc;
+        }
+
+        // note_type=call_in подписывает заметку в интерфейсе amoCRM как
+        // "Входящий звонок" — без явной пометки голосовое неотличимо от
+        // обычного звонка в списке заметок сделки.
+        var callResponsible = $"Голосовое сообщение [{displayTime:dd.MM.yyyy HH:mm}] {transcriptText}";
 
         // Прод: 400 FieldMissing на params.duration — не задокументировано
         // заранее amoCRM (как и params.source, см. CLAUDE.md), обязательность
