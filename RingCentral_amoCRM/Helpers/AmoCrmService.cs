@@ -1525,11 +1525,20 @@ public class AmoCrmService
             source = $"{source} [звонок {callStartUtc.Value:dd.MM.yyyy HH:mm} UTC]";
         }
 
+        // Для пропущенных record.duration — это время гудков до того, как звонок
+        // оборвался/ушёл на автоответчик, а не длительность разговора (разговора
+        // не было). Прод: uniq=ALX5Rg-kGFurxM1A, result=Missed, duration=37 —
+        // amoCRM рисует это как "Входящий звонок 00:37" с кнопкой "Прослушать",
+        // которая ведёт в никуда (записи нет), и менеджер не видит, что звонок
+        // пропущен. Принудительно 0 для result из MissedCallResults — есть
+        // отдельная текстовая пометка "(пропущенный звонок)" в source (см. выше).
+        var duration = isMissed ? 0 : record.duration;
+
         // Создаем объект params
         var paramsObject = new JsonObject
         {
             ["uniq"] = $"{record.id}",
-            ["duration"] = record.duration,
+            ["duration"] = duration,
             ["source"] = source,
             ["phone"] = $"{customerPhoneNumber}",
             ["call_responsible"] = $"{record.to.phoneNumber} - {record.to.name}"

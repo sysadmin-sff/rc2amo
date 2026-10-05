@@ -69,13 +69,18 @@ Call log:
     одну от voicemail-пути (тоже call_in, но с отдельным uniq = id
     голосового сообщения RC, не id звонка).
   - Пропущенные звонки (result=Missed/Hang Up) идут в ту же заметку
-    call_in/call_out, что и обычные, с params.duration=0 (поле
-    обязательно, см. выше) и source с пометкой "(пропущенный звонок)"
+    call_in/call_out, что и обычные, с params.duration ПРИНУДИТЕЛЬНО 0
+    (игнорируя record.duration) и source с пометкой "(пропущенный звонок)"
     (см. MissedCallResults/isMissed в AmoCrmService.CreateCallNoteAsync).
-    Отдельного поля под статус звонка в params call_in/call_out нет —
-    amoCRM v4 документирует только uniq/duration/source/link/phone/
-    call_responsible, выбор отразить статус в source сделан из-за
-    отсутствия альтернативы.
+    record.duration для этих result — время гудков до обрыва/автоответчика,
+    а не длительность разговора (разговора не было); если отправить его как
+    есть, amoCRM рисует заметку как обычный звонок с длительностью и кнопкой
+    "Прослушать", которая ведёт в никуда (записи нет) — проверено на проде
+    (uniq=ALX5Rg-kGFurxM1A, result=Missed, duration=37). Отдельного поля под
+    статус звонка в params call_in/call_out нет — amoCRM v4 документирует
+    только uniq/duration/source/link/phone/call_responsible, выбор отразить
+    статус в source (а не в отдельном поле) сделан из-за отсутствия
+    альтернативы в задокументированной схеме.
   - record.recording == null для пропущенных — ожидаемо, не ошибка;
     ProcessSingleCallAsync и так пропускает скачивание записи, когда
     record.recording?.id == null.
