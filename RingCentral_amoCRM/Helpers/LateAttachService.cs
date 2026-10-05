@@ -182,7 +182,10 @@ public class LateAttachService : BackgroundService
             return;
         }
 
-        var matched = candidateCalls.Where(r => MatchesAnyPhone(r, phones)).ToList();
+        var matched = candidateCalls
+            .Where(r => MatchesAnyPhone(r, phones))
+            .Where(r => _amoService.ShouldProcessCallResult(r.result))
+            .ToList();
         matchedCount = matched.Count;
 
         foreach (var record in matched)
@@ -199,7 +202,7 @@ public class LateAttachService : BackgroundService
                 ? record.from?.phoneNumber
                 : record.to?.phoneNumber;
 
-            _logger.LogInformation("LATE id={Id} number={Number} age_h={AgeH:F1}", record.id, searchNumber, ageHours);
+            _logger.LogInformation("LATE id={Id} number={Number} result={Result} age_h={AgeH:F1}", record.id, searchNumber, record.result, ageHours);
 
             CallProcessingResult result;
             try
@@ -269,7 +272,7 @@ public class LateAttachService : BackgroundService
                 perPage = CallLogPageSize,
                 page = page,
                 view = "Detailed",
-                withRecording = true,
+                withRecording = _amoService.CallLogWithRecordingFilter,
                 dateFrom = dateFrom.ToString("o"),
             };
 

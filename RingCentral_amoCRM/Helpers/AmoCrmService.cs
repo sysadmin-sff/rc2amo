@@ -527,11 +527,68 @@ public class AmoCrmService
     private const long ClosedLostStatusId = 143;
 
     // Значения RingCentral CallLogRecord.result, означающие, что разговор не
-    // состоялся (звонок пропущен/не принят/ушёл на автоответчик и т.п.).
+    // состоялся — используются только для пометки "(пропущенный звонок)" в
+    // source заметки (см. CreateCallNoteAsync), не для фильтрации, какие
+    // звонки обрабатывать вообще (см. MissedCallsProcessResults ниже).
+    // Сверено с реальными result на проде (CLAUDE.md): "No Answer", "Rejected",
+    // "Busy", "Abandoned" этим аккаунтом RC фактически не отдаются — набор
+    // сокращён до значений, которые действительно приходят. "Voicemail"
+    // сюда не входит: такие звонки отфильтровываются выше по потоку (см.
+    // MissedCallsProcessResults) и до этого метода не доходят вовсе.
     private static readonly HashSet<string> MissedCallResults = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Missed", "No Answer", "Voicemail", "Rejected", "Busy", "Abandoned"
+        "Missed", "Hang Up"
     };
+
+    // Включает обработку пропущенных звонков (без записи) — см. CLAUDE.md,
+    // раздел withRecording. По умолчанию выключено: прод сначала выкатывается
+    // с MissedCalls:Enabled=false (поведение как раньше, withRecording=true
+    // остаётся), включается отдельно после проверки логов.
+    private bool MissedCallsEnabled => _configuration.GetValue("MissedCalls:Enabled", false);
+
+    // Какие RingCentral CallLogRecord.result обрабатывать, когда
+    // MissedCalls:Enabled=true — настраивается через MissedCalls:ProcessResults
+    // (список через запятую), чтобы можно было сузить/расширить набор без
+    // пересборки. "Voicemail" намеренно отсутствует из значения по умолчанию:
+    // голосовая почта уже приходит отдельным путём через message-store (см.
+    // CLAUDE.md) — включение Voicemail сюда даст два уведомления на одно
+    // событие (call_in от call log и ещё один call_in от voicemail-пути с
+    // отдельным uniq). Не статический readonly, а вычисляется при каждом
+    // обращении — чтение IConfiguration дёшево, а конфигурация технически
+    // может поменяться между вызовами (hot reload appsettings.json).
+    private HashSet<string> MissedCallsProcessResults
+    {
+        get
+        {
+            var raw = _configuration["MissedCalls:ProcessResults"];
+            var values = string.IsNullOrWhiteSpace(raw)
+                ? new[] { "Call connected", "Accepted", "Missed", "Hang Up" }
+                : raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            return new HashSet<string>(values, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    // Единая точка решения "обрабатывать ли этот call log record" для POLL/
+    // STARTUP/LATE. Инкапсулирует обе части переключателя: при
+    // MissedCalls:Enabled=false — только withRecording=true-подобное
+    // поведение (есть запись); при true — разрешённый список result.
+    public bool ShouldProcessCallResult(string result)
+    {
+        if (!MissedCallsEnabled)
+        {
+            // Старое поведение держалось на withRecording=true в самом запросе
+            // к RC (убирается вызывающим кодом только когда флаг включён) —
+            // здесь достаточно не фильтровать по result вовсе.
+            return true;
+        }
+
+        return !string.IsNullOrEmpty(result) && MissedCallsProcessResults.Contains(result);
+    }
+
+    // Используется CallLogPollingService/LateAttachService, чтобы решить,
+    // ставить ли withRecording=true в параметры запроса к RC call-log.
+    public bool CallLogWithRecordingFilter => !MissedCallsEnabled;
 
     // Picks a single target lead out of a pool of candidates: prefers the most
     // recently updated OPEN lead (status not closed-won/closed-lost); if none

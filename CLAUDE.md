@@ -49,10 +49,39 @@
     сравнение с ним в коде сделано регистронезависимым на всякий случай.
 
 Call log:
-- withRecording=true в call log — намеренный фильтр, отсекает пропущенные
-  звонки (голосовая почта из автоответчика туда не попадает). Не убирать
-  без учёта: голосовая почта обрабатывается отдельно (см. voicemail-фичу,
-  message-store, регистр см. выше), и если withRecording когда-нибудь
-  снимут, один пропущенный звонок с голосовым сообщением даст ДВЕ заметки —
-  одну от call log (call_in), одну от voicemail-пути (тоже call_in, но с
-  отдельным uniq = id голосового сообщения RC, не id звонка).
+- withRecording=true в call log — решение ПЕРЕСМОТРЕНО (раньше было
+  намеренным фильтром, отсекавшим все пропущенные звонки целиком). Теперь
+  управляется флагом MissedCalls:Enabled (env MissedCalls__Enabled,
+  по умолчанию false):
+  - false (как раньше) — withRecording=true во всех трёх путях (POLL,
+    STARTUP, LateAttach), пропущенные звонки не обрабатываются вовсе.
+  - true — withRecording убирается из запроса к RC во всех трёх путях,
+    а какие именно result обрабатывать — решает отдельный allowlist
+    MissedCalls:ProcessResults (env MissedCalls__ProcessResults, список
+    через запятую, по умолчанию "Call connected,Accepted,Missed,Hang Up").
+    Записи с result не из этого списка молча пропускаются
+    (action=skip reason=result_not_in_allowlist в логе).
+  - result="Voicemail" НЕ входит в список по умолчанию и не должен туда
+    добавляться: голосовая почта уже обрабатывается отдельно через
+    message-store (см. voicemail-фичу, регистр "Voicemail"/"VoiceMail"
+    выше). Если Voicemail попадёт в allowlist, один пропущенный звонок
+    с голосовым сообщением даст ДВЕ заметки — одну от call log (call_in),
+    одну от voicemail-пути (тоже call_in, но с отдельным uniq = id
+    голосового сообщения RC, не id звонка).
+  - Пропущенные звонки (result=Missed/Hang Up) идут в ту же заметку
+    call_in/call_out, что и обычные, с params.duration=0 (поле
+    обязательно, см. выше) и source с пометкой "(пропущенный звонок)"
+    (см. MissedCallResults/isMissed в AmoCrmService.CreateCallNoteAsync).
+    Отдельного поля под статус звонка в params call_in/call_out нет —
+    amoCRM v4 документирует только uniq/duration/source/link/phone/
+    call_responsible, выбор отразить статус в source сделан из-за
+    отсутствия альтернативы.
+  - record.recording == null для пропущенных — ожидаемо, не ошибка;
+    ProcessSingleCallAsync и так пропускает скачивание записи, когда
+    record.recording?.id == null.
+  - Рост объёма (прод, 3 дня: 87 обрабатывалось → +38 при снятии
+    фильтра) не требует правок RcHeavyGroupRateLimiter/пагинации:
+    лимитер гейтит только call-log-list и recording-content; у
+    пропущенных звонков записи нет, то есть нагрузка на recording-content
+    не растёт, а page cap (10 страниц × 100/POLL, 50 × 100/STARTUP и
+    LateAttach) имеет большой запас на дополнительные ~13 записей/день.

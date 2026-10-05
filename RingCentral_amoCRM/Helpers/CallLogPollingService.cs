@@ -262,7 +262,7 @@ public class CallLogPollingService : BackgroundService
                 perPage = CallLogPageSize,
                 page = page,
                 view = "Detailed",
-                withRecording = true,
+                withRecording = _amoService.CallLogWithRecordingFilter,
                 dateFrom = dateFrom.ToString("o"),
             };
             var (callLogs, callLogFailed) = await TryFetchCallLogPageAsync(
@@ -290,6 +290,12 @@ public class CallLogPollingService : BackgroundService
                         continue;
                     }
 
+                    if (!_amoService.ShouldProcessCallResult(record.result))
+                    {
+                        _logger.LogInformation("STARTUP id={Id} result={Result} action=skip reason=result_not_in_allowlist", record.id, record.result);
+                        continue;
+                    }
+
                     DateTime? callStartUtc = string.IsNullOrEmpty(record.startTime)
                         ? null
                         : DateTime.Parse(record.startTime, null,
@@ -304,6 +310,7 @@ public class CallLogPollingService : BackgroundService
                     // следующий деплой/рестарт повторит этот же проход. По той же
                     // причине неудачное скачивание записи (CMN-301 после повторов)
                     // тоже откладывает звонок целиком, а не создаёт заметку без записи.
+                    _logger.LogInformation("STARTUP id={Id} result={Result}", record.id, record.result);
                     await _amoService.ProcessSingleCallAsync(record, _guard, "STARTUP", callStartUtc, failClosed: true);
 
                     // Пауза между звонками с записью — при догоне после простоя записей
@@ -358,7 +365,7 @@ public class CallLogPollingService : BackgroundService
                     perPage = CallLogPageSize,
                     page = page,
                     view = "Detailed",
-                    withRecording = true,
+                    withRecording = _amoService.CallLogWithRecordingFilter,
                     dateFrom = dateFrom.ToString("o"),
                 };
                 var (callLogs, callLogFailed) = await TryFetchCallLogPageAsync(
@@ -400,7 +407,13 @@ public class CallLogPollingService : BackgroundService
                             continue;
                         }
 
-                        _logger.LogInformation($"Start processing call {record.id} call completed at {record.startTime}");
+                        if (!_amoService.ShouldProcessCallResult(record.result))
+                        {
+                            _logger.LogInformation("POLL id={Id} result={Result} action=skip reason=result_not_in_allowlist", record.id, record.result);
+                            continue;
+                        }
+
+                        _logger.LogInformation("POLL id={Id} result={Result} Start processing call, call completed at {StartTime}", record.id, record.result, record.startTime);
                         await _amoService.ProcessSingleCallAsync(record, _guard, "POLL");
                     }
                     catch (Exception ex)
