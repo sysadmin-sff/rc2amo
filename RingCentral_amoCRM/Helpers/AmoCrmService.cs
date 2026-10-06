@@ -1534,6 +1534,21 @@ public class AmoCrmService
         // отдельная текстовая пометка "(пропущенный звонок)" в source (см. выше).
         var duration = isMissed ? 0 : record.duration;
 
+        // amoCRM выводит params.call_responsible в заголовок записи в ленте
+        // сделки (как у голосовых, см. CreateVoicemailNoteAsync), а
+        // params.source — нет. Пометка "(пропущенный звонок)" в source (выше)
+        // поэтому невидима в заголовке: прод, сделка 23546553 — голосовое
+        // показывает "Входящий звонок ... кому: Голосовое сообщение [...]",
+        // а пропущенный — просто "Входящий звонок ... кому: +1... -" без
+        // всякой пометки. Дублируем пометку в call_responsible, чтобы она
+        // тоже попала в заголовок; call_responsible при этом не теряет
+        // исходные номер/имя callee.
+        var callResponsible = $"{record.to.phoneNumber} - {record.to.name}";
+        if (isMissed)
+        {
+            callResponsible = $"ПРОПУЩЕННЫЙ ЗВОНОК — {callResponsible}";
+        }
+
         // Создаем объект params
         var paramsObject = new JsonObject
         {
@@ -1541,7 +1556,7 @@ public class AmoCrmService
             ["duration"] = duration,
             ["source"] = source,
             ["phone"] = $"{customerPhoneNumber}",
-            ["call_responsible"] = $"{record.to.phoneNumber} - {record.to.name}"
+            ["call_responsible"] = callResponsible
         };
 
         // Добавляем link только если он не пустой
