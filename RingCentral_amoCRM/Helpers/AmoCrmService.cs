@@ -320,6 +320,26 @@ public class AmoCrmService
         return _currentToken.AccessToken;
     }
 
+    // Безусловный refresh — в отличие от GetAccessTokenAsync (который обновляет
+    // только если _currentToken протух локально), вызывается при 401 от
+    // amoCRM Drive (см. UploadBytesToAmoDriveAsync), когда основной
+    // _httpClient-токен ещё валиден для /api/v4/* (контакты/заметки отвечают
+    // 200), а drive-b.amocrm.ru уже не принимает его — локальная проверка
+    // IsExpired() в этой ситуации не поможет, т.к. _tokenExpiration ещё не
+    // наступил. Один форс-рефреш — попытка синхронизировать токен Drive с
+    // основным без лишних повторов (вызывающий код сам решает, сколько раз
+    // повторять запрос после этого).
+    public async Task ForceRefreshAccessTokenAsync()
+    {
+        var refreshToken = _currentToken?.RefreshToken ?? _configuration["AmoCrm:RefreshToken"];
+        if (string.IsNullOrWhiteSpace(refreshToken))
+        {
+            throw new InvalidOperationException("No refresh token available to force-refresh access token.");
+        }
+
+        await RefreshTokensAsync(refreshToken);
+    }
+
     private async Task RefreshTokensAsync(string refreshToken)
     {
         _logger.LogInformation("Attempting to refresh amoCRM tokens...");
@@ -1292,6 +1312,42 @@ public class AmoCrmService
         }
     }
 
+    // Один повтор на 401 от amoCRM Drive (drive-b.amocrm.ru), с принудительным
+    // обновлением токена перед повтором. Прод, 30 октября ~12:28-13:41:
+    // обычные /api/v4/* запросы (контакты, заметки) отвечали 200 всё это
+    // время — значит, основной токен был жив, но drive-b.amocrm.ru уже не
+    // принимал тот же Bearer (ErrOAuth2Exception "An access token is
+    // required to request this resource"). Перезапуск сервиса (который
+    // форсит обновление токена при старте) сразу же починил загрузку —
+    // то есть сам процесс обновления токена устраняет проблему, просто
+    // раньше ничего не вызывало его в ответ на такой 401. driveClient
+    // передаётся сюда и заголовок переустанавливается на нём же — локальный
+    // HttpClient внутри UploadBytesToAmoDriveAsync, а не _httpClient.
+    private async Task<HttpResponseMessage> PostToDriveWithAuthRetryAsync(
+        HttpClient driveClient, string url, Func<HttpContent> createContent, string opLabel)
+    {
+        var response = await driveClient.PostAsync(url, createContent());
+        if (response.StatusCode != System.Net.HttpStatusCode.Unauthorized)
+        {
+            return response;
+        }
+
+        _logger.LogWarning("{OpLabel}: amoCRM Drive returned 401, forcing token refresh and retrying once", opLabel);
+
+        try
+        {
+            await ForceRefreshAccessTokenAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "{OpLabel}: forced token refresh failed, giving up after the 401", opLabel);
+            return response;
+        }
+
+        driveClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization;
+        return await driveClient.PostAsync(url, createContent());
+    }
+
     // Общая часть UploadCallRecordingAsync/UploadVoicemailRecordingAsync:
     // байты уже скачаны с RC (это специфично для звонка/голосового и
     // остаётся в каждом из них), дальше — одинаковая загрузка в amoCRM Drive
@@ -1329,16 +1385,15 @@ public class AmoCrmService
             content_type = contentType
         };
 
-        var sessionContent = new StringContent(
-            JsonSerializer.Serialize(sessionPayload),
-            Encoding.UTF8,
-            "application/json");
-
         using var driveClient = new HttpClient();
         driveClient.Timeout = TimeSpan.FromMinutes(5);
         driveClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization;
 
-        var sessionResponse = await driveClient.PostAsync($"{driveUrl}/v1.0/sessions", sessionContent);
+        var sessionResponse = await PostToDriveWithAuthRetryAsync(
+            driveClient,
+            $"{driveUrl}/v1.0/sessions",
+            () => new StringContent(JsonSerializer.Serialize(sessionPayload), Encoding.UTF8, "application/json"),
+            "UploadSession");
 
         if (!sessionResponse.IsSuccessStatusCode)
         {
@@ -1363,12 +1418,24 @@ public class AmoCrmService
         while (offset < content.Length)
         {
             int partSize = Math.Min(maxPartSize, content.Length - offset);
-            var partContent = new ByteArrayContent(content, offset, partSize);
-            partContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+            var partOffset = offset;
 
             _logger.LogInformation("Uploading part: offset={Offset}, size={PartSize}", offset, partSize);
 
-            var uploadResponse = await driveClient.PostAsync(nextUrl, partContent);
+            // createContent строит новый ByteArrayContent на каждый вызов —
+            // HttpContent, уже отправленный через PostAsync, нельзя переслать
+            // повторно (InvalidOperationException), а PostToDriveWithAuthRetryAsync
+            // при 401 вызывает createContent() второй раз для повтора.
+            var uploadResponse = await PostToDriveWithAuthRetryAsync(
+                driveClient,
+                nextUrl,
+                () =>
+                {
+                    var partContent = new ByteArrayContent(content, partOffset, partSize);
+                    partContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+                    return partContent;
+                },
+                "UploadPart");
 
             if (!uploadResponse.IsSuccessStatusCode)
             {
@@ -1492,10 +1559,31 @@ public class AmoCrmService
         }
     }
 
+    // amoCRM v4: params.call_responsible ограничен 255 символами — прод,
+    // 28 октября, длинная расшифровка голосового дала 400 TooLong на
+    // params.call_responsible, заметка не создавалась вовсе (см.
+    // CreateVoicemailNoteAsync). source/phone/uniq/link собираются из
+    // известных коротких частей (имя/номер абонента, статические пометки) и
+    // этому лимиту на практике не подвержены, но call_responsible — единственное
+    // поле, куда попадает переменный по длине внешний текст (расшифровка),
+    // так что усечение применяется именно к нему, с обеих заметок
+    // (CreateCallNoteAsync и CreateVoicemailNoteAsync).
+    private const int AmoCrmParamMaxLength = 255;
+
+    private static string TruncateForAmoCrm(string value, int maxLength = AmoCrmParamMaxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value.Substring(0, maxLength - 1) + "…";
+    }
+
     // Возвращает true только при 2xx-ответе amoCRM на создание заметки.
     // Вызывающий код (ProcessSingleCallAsync) обязан проверить результат —
     // не-2xx не должен трактоваться как успех.
-    public async Task<bool> CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed, DateTime? callStartUtc = null)
+    public async Task<bool> CreateCallNoteAsync(long leadId, RingCentral.CallLogRecord record, string recURL, string customerPhoneNumber, bool isMissed, DateTime? callStartUtc = null, bool recordingUploadFailed = false)
     {
         const string entityType = "leads";
         const long responsibleUserId = 8644141;
@@ -1515,6 +1603,19 @@ public class AmoCrmService
         if (isMissed)
         {
             source = $"{source} (пропущенный звонок)";
+        }
+
+        // recordingUploadFailed=true — POLL создаёт эту заметку без записи
+        // после исчерпания повторов скачивания/загрузки (см.
+        // ProcessSingleCallAsync, RecordingUploadOutcome.Failed, ветка
+        // failClosed=false). Без явной пометки заметка неотличима от
+        // обычного звонка, у которого записи никогда не было (result
+        // позволяет это понять, но не виден напрямую в интерфейсе) — менеджер
+        // видел бы звонок без кнопки "Прослушать" и не понимал бы, что
+        // запись где-то потерялась, а не отсутствовала изначально.
+        if (recordingUploadFailed)
+        {
+            source = $"{source} (запись не загружена)";
         }
 
         // Человекочитаемая метка времени звонка в тексте — страховка на случай,
@@ -1548,15 +1649,19 @@ public class AmoCrmService
         {
             callResponsible = $"ПРОПУЩЕННЫЙ ЗВОНОК — {callResponsible}";
         }
+        else if (recordingUploadFailed)
+        {
+            callResponsible = $"ЗАПИСЬ НЕ ЗАГРУЖЕНА — {callResponsible}";
+        }
 
         // Создаем объект params
         var paramsObject = new JsonObject
         {
             ["uniq"] = $"{record.id}",
             ["duration"] = duration,
-            ["source"] = source,
+            ["source"] = TruncateForAmoCrm(source),
             ["phone"] = $"{customerPhoneNumber}",
-            ["call_responsible"] = callResponsible
+            ["call_responsible"] = TruncateForAmoCrm(callResponsible)
         };
 
         // Добавляем link только если он не пустой
@@ -1685,7 +1790,15 @@ public class AmoCrmService
         // note_type=call_in подписывает заметку в интерфейсе amoCRM как
         // "Входящий звонок" — без явной пометки голосовое неотличимо от
         // обычного звонка в списке заметок сделки.
-        var callResponsible = $"Голосовое сообщение [{displayTime:dd.MM.yyyy HH:mm}] {transcriptText}";
+        //
+        // Прод, 28 октября: расшифровка без ограничения длины дала 400
+        // TooLong на params.call_responsible (лимит amoCRM — 255 символов,
+        // см. TruncateForAmoCrm), заметка не создавалась совсем — ни времени,
+        // ни пометки "голосовое" менеджер не видел. Время и маркер важнее
+        // полного текста расшифровки, поэтому обрезается именно
+        // transcriptText (через итоговую строку целиком), а не отбрасывается
+        // весь callResponsible при превышении лимита.
+        var callResponsible = TruncateForAmoCrm($"Голосовое сообщение [{displayTime:dd.MM.yyyy HH:mm}] {transcriptText}");
 
         // Прод: 400 FieldMissing на params.duration — не задокументировано
         // заранее amoCRM (как и params.source, см. CLAUDE.md), обязательность
@@ -1697,7 +1810,7 @@ public class AmoCrmService
         {
             ["uniq"] = voicemailId,
             ["duration"] = durationSeconds,
-            ["source"] = source,
+            ["source"] = TruncateForAmoCrm(source),
             ["phone"] = $"{callerNumber}",
             ["call_responsible"] = callResponsible
         };
@@ -1816,6 +1929,7 @@ public class AmoCrmService
             }
 
             string permanentRecordingUrl = null;
+            bool recordingUploadFailed = false;
             if (record.recording?.id != null)
             {
                 var uploadResult = await UploadCallRecordingAsync(record.recording.id, record.id);
@@ -1839,8 +1953,15 @@ public class AmoCrmService
                         return CallProcessingResult.Error;
                     }
 
+                    // Прод 30.10: NoteExistsAsync увидит эту заметку на следующих
+                    // циклах и даст action=dup — повторной попытки докачать запись
+                    // после создания заметки здесь нет (отдельная задача, не делаем
+                    // сейчас). Явная пометка в source/call_responsible (см.
+                    // CreateCallNoteAsync) — чтобы менеджер видел, что запись
+                    // потерялась технически, а не что её не было изначально.
+                    recordingUploadFailed = true;
                     _logger.LogWarning(
-                        "{Prefix} id={Id} number={Number} lead={LeadId} reason=recording_download_failed: creating note without recording (no next attempt in this path)",
+                        "{Prefix} id={Id} number={Number} lead={LeadId} reason=recording_download_failed: creating note without recording, marked (no next attempt in this path)",
                         logPrefix, record.id, searchNumber, targetLeadId);
                 }
                 // RecordingUploadOutcome.NotAvailable — у звонка на стороне RC нет
@@ -1849,7 +1970,7 @@ public class AmoCrmService
 
             bool isMissed = record.result != null && MissedCallResults.Contains(record.result);
 
-            bool noteCreated = await CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed, callStartUtc);
+            bool noteCreated = await CreateCallNoteAsync(targetLeadId.Value, record, permanentRecordingUrl, searchNumber, isMissed, callStartUtc, recordingUploadFailed);
             if (!noteCreated)
             {
                 // Не помечаем guard.MarkProcessed — заметка не создана, звонок
